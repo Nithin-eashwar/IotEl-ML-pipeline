@@ -5,20 +5,24 @@ Cleans raw CSV data, engineers windowed features, and compares Random Forest
 and KNN classifiers with leakage-resistant chronological evaluation.
 
 Changes vs original:
-  - Class 2 trimmed to largest contiguous segment (rows 2710+) to remove
-    the concatenated sub-recordings identified by timestamp reset.
-  - Cross-session test added for Class 3 (heavy_load) using a separate
-    recording in class3_heavy_load_test.csv.
+  - Class 2 trimmed to largest contiguous segment to remove timestamp-reset artefact.
+  - Cross-session test using new-session CSVs for classes 2, 3, 4 (batched).
+  - Matplotlib confusion matrix saved to disk for easy sharing.
 
 Run: python nilm_pipeline.py
 """
 
+import argparse
 import os
 import warnings
 
 # Avoid unreliable physical-core detection in some restricted Windows shells.
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend — safe for all environments
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 from scipy.fft import rfft, rfftfreq
@@ -48,10 +52,35 @@ FILE_MAP = {
 }
 
 # Cross-session test files: {class_label: (filepath, encoding)}
-# Only class 3 has a separate-session recording right now.
+# New-session recordings for classes 1, 2, 3, 4.
 CROSS_SESSION_MAP = {
-    3: ("class3_heavy_load_test.csv", "utf-16"),
+    1: ("1_unloaded_test.csv",     "utf-8"),
+    2: ("2_light_load_test.csv",   "utf-8"),
+    3: ("3_heavy_load_test.csv",   "utf-8"),
+    4: ("4_stall_test.csv",        "utf-8"),
 }
+
+# SESSION_MAP: both recording sessions used for LOSO.
+# Format: {session_id: {class_label: (filepath, encoding, keep_largest_segment)}}
+# keep_largest_segment=True trims to the longest contiguous block (handles
+# timestamp resets and files with extra trailing commas/gaps).
+SESSION_MAP = {
+    "A": {
+        1: ("class1_unloaded__1_.csv",   "utf-8", False),
+        2: ("class2_light_load__1_.csv", "utf-8", True),   # has internal timestamp reset
+        3: ("class3_heavy_load__1_.csv", "utf-8", False),
+        4: ("class4_stall.csv",          "utf-8", False),
+    },
+    "B": {
+        1: ("1_unloaded_test.csv",       "utf-8", False),  # no real gaps; segment trim causes fragmentation
+        2: ("2_light_load_test.csv",     "utf-8", True),
+        3: ("3_heavy_load_test.csv",     "utf-8", True),
+        4: ("4_stall_test.csv",          "utf-8", True),
+    },
+}
+
+# Where to save output figures.
+OUTPUT_DIR = "results"
 
 CLASS_NAMES = {
     1: "unloaded",
@@ -146,6 +175,30 @@ def load_and_clean(filepath, label, encoding="utf-8", keep_largest_segment=False
     print(
         f"  Class {label}: {before_filter} rows -> {after} clean "
         f"({dropped} dead-current rows dropped, {dropped_pct:.1f}%{seg_note})"
+    )
+    return df.reset_index(drop=True)
+
+
+def load_session_file(filepath, label, encoding="utf-8", keep_largest=False):
+    """
+    Unified loader for both Session A and Session B files.
+    Some files start with 9 columns, some with 13, 17, or 19.
+    By providing names=range(25), pandas will read all rows regardless of length
+    (padding short rows with NaN and accepting up to 25 columns).
+    We then slice the first 13 columns to match our expected schema.
+    """
+    raw = pd.read_csv(
+        filepath, header=None, names=range(25), on_bad_lines="skip", encoding=encoding
+    )
+    raw = raw.iloc[:, : len(COLS)]  # keep only the first 13 columns
+    raw.columns = COLS
+    before = len(raw)
+    df = _parse_and_filter(raw, label)
+    if keep_largest:
+        df = _largest_contiguous_segment(df)
+    print(
+        f"    Class {label} ({CLASS_NAMES[label]}): "
+        f"{before} raw -> {len(df)} clean rows"
     )
     return df.reset_index(drop=True)
 
@@ -262,7 +315,11 @@ def build_dataset(data_by_class):
     for label, df in data_by_class.items():
         X_class, y_class, starts = build_feature_matrix(df)
         if X_class.empty:
-            raise ValueError(f"Class {label} produced no complete windows.")
+            print(
+                f"  [WARN] Class {label} ({CLASS_NAMES.get(label, label)}): "
+                f"fewer than {WINDOW_SIZE} rows after cleaning — skipped."
+            )
+            continue
 
         feature_frames.append(X_class)
         label_arrays.append(y_class)
@@ -401,11 +458,12 @@ def get_models():
 
 
 # ─── EVALUATION ───────────────────────────────────────────────────────────────
-def evaluate_development(X, y, splits, feature_variants):
+def evaluate_development(X, y, splits, feature_variants,
+                         header="[4] Purged blocked validation and feature ablation..."):
     results = []
     scoring = {"accuracy": "accuracy", "macro_f1": "f1_macro"}
 
-    print("\n[4] Purged blocked validation and feature ablation...")
+    print(f"\n{header}")
     for variant_name, feature_columns in feature_variants.items():
         print(f"\n  {variant_name} ({len(feature_columns)} features)")
         for model_name, model in get_models().items():
@@ -550,72 +608,146 @@ def load_cross_session_data():
     """
     Load the cross-session test files and return a dict of
     {label: DataFrame} using the same cleaning pipeline.
+    Handles CSVs that have extra trailing comma-separated columns.
     """
     cross_data = {}
     print("\n[A] Loading cross-session test data...")
     for label, (filepath, encoding) in CROSS_SESSION_MAP.items():
-        df = pd.read_csv(
-            filepath, header=None, names=COLS, on_bad_lines="skip", encoding=encoding
+        # Read without fixed column names so extra trailing columns are tolerated
+        raw = pd.read_csv(
+            filepath, header=None, on_bad_lines="skip", encoding=encoding
         )
-        before = len(df)
-        df = _parse_and_filter(df, label)
+        # Keep only the first 13 columns (our expected schema)
+        raw = raw.iloc[:, : len(COLS)]
+        raw.columns = COLS
+        before = len(raw)
+        df = _parse_and_filter(raw, label)
+        # If there is a timestamp gap, keep the largest contiguous segment
+        df = _largest_contiguous_segment(df)
         after = len(df)
         ts = df["timestamp_ms"].values
         n_windows = max(0, (len(df) - WINDOW_SIZE) // STEP_SIZE + 1)
         print(
             f"  Class {label} ({CLASS_NAMES[label]}): {before} raw -> {after} clean rows  "
-            f"ts {ts[0]:.0f}–{ts[-1]:.0f} ms ({(ts[-1]-ts[0])/1000:.1f}s)  "
-            f"~{n_windows} windows"
+            f"({(ts[-1]-ts[0])/1000:.1f}s)  ~{n_windows} windows"
         )
         cross_data[label] = df
     return cross_data
 
 
-def evaluate_cross_session(best, X_dev, y_dev, cross_data):
+def _save_confusion_matrix_figure(
+    cm, labels, title, filepath, acc, macro_f1, model_name, feature_variant
+):
+    """Render and save a polished confusion matrix figure using matplotlib."""
+    n = len(labels)
+    fig, ax = plt.subplots(figsize=(max(6, n * 1.6), max(5, n * 1.4)))
+    fig.patch.set_facecolor("#0f1117")
+    ax.set_facecolor("#0f1117")
+
+    # Normalised values for colour, raw counts for text
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm = np.where(row_sums == 0, 0, cm / row_sums.astype(float))
+
+    im = ax.imshow(cm_norm, interpolation="nearest", cmap="Blues", vmin=0, vmax=1)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+    cbar.ax.tick_params(colors="#cccccc", labelsize=9)
+    cbar.outline.set_edgecolor("#333333")
+
+    # Cell annotations
+    thresh = cm_norm.max() / 2.0
+    for i in range(n):
+        for j in range(n):
+            pct = cm_norm[i, j] * 100
+            count = cm[i, j]
+            color = "white" if cm_norm[i, j] > thresh else "#cccccc"
+            ax.text(
+                j, i,
+                f"{pct:.1f}%\n({count})",
+                ha="center", va="center",
+                fontsize=10, fontweight="bold", color=color,
+            )
+
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=11, color="#eeeeee")
+    ax.set_yticklabels(labels, fontsize=11, color="#eeeeee")
+    ax.tick_params(axis="both", colors="#555555")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333333")
+
+    ax.set_xlabel("Predicted label", fontsize=12, color="#aaaaaa", labelpad=10)
+    ax.set_ylabel("True label", fontsize=12, color="#aaaaaa", labelpad=10)
+
+    subtitle = (
+        f"Model: {model_name}  |  Features: {feature_variant}\n"
+        f"Accuracy: {acc:.1f}%   Macro-F1: {macro_f1:.1f}%   "
+        f"(classes tested: {', '.join(labels)})"
+    )
+    ax.set_title(
+        f"{title}\n",
+        fontsize=14, fontweight="bold", color="white", pad=12
+    )
+    fig.text(
+        0.5, 0.94, subtitle,
+        ha="center", va="center",
+        fontsize=9, color="#aaaaaa",
+    )
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(filepath, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Figure saved -> {filepath}")
+
+
+def evaluate_cross_session(best, X_dev, y_dev, cross_data, output_dir):
     """
-    Train the best model on the full development set, then predict on
-    the cross-session windows for the available classes only.
-    Prints detailed numbers: accuracy per window, per-sample raw stats,
-    and a confusion matrix (for the subset of labels available).
+    Train the best model on the full development set, then predict on the
+    cross-session windows for all available classes in a single batch.
+    Saves a matplotlib confusion matrix figure.
     """
+    os.makedirs(output_dir, exist_ok=True)
+
     columns = best["features"]
     model = clone(best["model"])
     model.fit(X_dev[columns], y_dev)
 
-    print("\n[B] Cross-session test — per-class window predictions")
+    print("\n[B] Cross-session test — per-class window predictions (batched)")
     print(f"  Model: {best['model_name']}  |  Features: {best['variant']}")
-    print(f"  {'Class':<12} {'Windows':>7}  {'Correct':>7}  {'Acc':>7}  "
-          f"{'Pred distribution'}")
+    print(
+        f"  {'Class':<12} {'Windows':>7}  {'Correct':>7}  {'Acc':>7}  "
+        f"{'Prediction breakdown'}"
+    )
 
     all_true = []
     all_pred = []
 
-    for label, df in cross_data.items():
-        X_cs, y_cs, _ = build_feature_matrix(df)
+    for label in sorted(cross_data):
+        df = cross_data[label]
+        X_cs, _, _ = build_feature_matrix(df)
         if X_cs.empty:
-            print(f"  Class {label}: no complete windows (need >= {WINDOW_SIZE} rows)")
+            print(f"  Class {label} ({CLASS_NAMES[label]}): "
+                  f"no complete windows (need >= {WINDOW_SIZE} rows)")
             continue
 
-        # Align columns (fill any missing with 0)
         X_cs = X_cs.reindex(columns=columns, fill_value=0)
         preds = model.predict(X_cs)
-        correct = np.sum(preds == label)
-        acc = correct / len(preds) * 100
+        correct = int(np.sum(preds == label))
+        acc_cls = correct / len(preds) * 100
 
-        # Distribution of predictions
         pred_counts = {
-            CLASS_NAMES[l]: np.sum(preds == l)
+            CLASS_NAMES[l]: int(np.sum(preds == l))
             for l in sorted(CLASS_NAMES)
             if np.sum(preds == l) > 0
         }
         dist_str = "  ".join(f"{k}={v}" for k, v in pred_counts.items())
-
         print(
             f"  {CLASS_NAMES[label]:<12} {len(preds):>7}  {correct:>7}  "
-            f"{acc:>6.1f}%  {dist_str}"
+            f"{acc_cls:>6.1f}%  {dist_str}"
         )
         all_true.extend([label] * len(preds))
-        all_pred.extend(preds)
+        all_pred.extend(preds.tolist())
 
     if not all_true:
         print("  No windows available for cross-session evaluation.")
@@ -625,9 +757,13 @@ def evaluate_cross_session(best, X_dev, y_dev, cross_data):
     all_pred = np.array(all_pred)
     overall_acc = accuracy_score(all_true, all_pred) * 100
     overall_f1 = f1_score(all_true, all_pred, average="macro", zero_division=0) * 100
-    print(f"\n  Overall cross-session  Acc={overall_acc:.1f}%  macro-F1={overall_f1:.1f}%")
+    print(
+        f"\n  Overall cross-session -> "
+        f"Acc={overall_acc:.1f}%   macro-F1={overall_f1:.1f}%"
+    )
 
-    print("\n[C] Cross-session detailed report (for available classes)...")
+    # ── Detailed text report ──────────────────────────────────────────────────
+    print("\n[C] Cross-session classification report (available classes only)...")
     labels_present = sorted(np.unique(all_true))
     target_names = [CLASS_NAMES[l] for l in labels_present]
     print(
@@ -639,56 +775,212 @@ def evaluate_cross_session(best, X_dev, y_dev, cross_data):
         )
     )
 
-    print("  Confusion Matrix (cross-session):")
+    print("  Text confusion matrix (cross-session):")
     print_confusion_matrix(all_true, all_pred, labels_present)
 
-    print("\n[D] Raw signal statistics — session A vs cross-session (class 3 only)")
-    print(f"  {'Metric':<20} {'Session A':>12}  {'Cross-session':>14}")
-    print("  " + "-" * 50)
+    # ── Matplotlib confusion matrix ───────────────────────────────────────────
+    print("\n[E] Saving confusion matrix figures...")
+    cm = confusion_matrix(all_true, all_pred, labels=labels_present)
+    label_names = [CLASS_NAMES[l] for l in labels_present]
 
-    # Pull session A class-3 data for comparison
-    sa_df = pd.read_csv(FILE_MAP[3], header=None, names=COLS, on_bad_lines="skip")
-    for c in COLS:
-        sa_df[c] = pd.to_numeric(sa_df[c], errors="coerce")
-    sa_df = sa_df.dropna(subset=["timestamp_ms", "ina_a_ma"])
-    sa_df = sa_df[sa_df["ina_a_ma"].abs() >= DEAD_CURRENT_THRESHOLD]
+    # (i) Batched cross-session figure
+    cs_fig_path = os.path.join(output_dir, "confusion_matrix_cross_session.png")
+    _save_confusion_matrix_figure(
+        cm=cm,
+        labels=label_names,
+        title="Cross-Session Confusion Matrix",
+        filepath=cs_fig_path,
+        acc=overall_acc,
+        macro_f1=overall_f1,
+        model_name=best["model_name"],
+        feature_variant=best["variant"],
+    )
 
-    cs_df = cross_data.get(3)
-    if cs_df is not None:
-        for col, label_str in [
-            ("ina_a_ma", "Current mean (mA)"),
-            ("ina_a_mw", "Power mean (mW)"),
-            ("accel_rms", "Accel RMS mean"),
-        ]:
-            sa_val = sa_df[col].mean() if col in sa_df.columns else float("nan")
-            cs_val = cs_df[col].mean() if col in cs_df.columns else float("nan")
-            print(f"  {label_str:<20} {sa_val:>12.3f}  {cs_val:>14.3f}")
+    # ── Signal statistics comparison ──────────────────────────────────────────
+    print("\n[D] Raw signal statistics — Session A vs Cross-session (per class)")
+    header = f"  {'Class':<12}  {'Metric':<20}  {'Session A':>11}  {'Cross-session':>13}"
+    print(header)
+    print("  " + "-" * 62)
 
-        for col, label_str in [
-            ("ina_a_ma", "Current std (mA)"),
-            ("accel_rms", "Accel RMS std"),
-        ]:
-            sa_val = sa_df[col].std() if col in sa_df.columns else float("nan")
-            cs_val = cs_df[col].std() if col in cs_df.columns else float("nan")
-            print(f"  {label_str:<20} {sa_val:>12.3f}  {cs_val:>14.3f}")
-
-        # Window-level accel_rms_std comparison
-        def window_accel_rms_std(df_):
-            stds = []
-            rms = df_["accel_rms"].values
-            for s in range(0, len(rms) - WINDOW_SIZE + 1, STEP_SIZE):
-                stds.append(np.std(rms[s:s + WINDOW_SIZE]))
-            return np.array(stds)
-
-        sa_ws = window_accel_rms_std(sa_df)
-        cs_ws = window_accel_rms_std(cs_df)
-        print(
-            f"  {'accel_rms_std/win':<20} {sa_ws.mean():>12.4f}  {cs_ws.mean():>14.4f}"
+    for label in sorted(cross_data):
+        cs_df = cross_data[label]
+        sa_raw = pd.read_csv(
+            FILE_MAP[label], header=None, names=COLS, on_bad_lines="skip", encoding="utf-8"
         )
+        for c in COLS:
+            sa_raw[c] = pd.to_numeric(sa_raw[c], errors="coerce")
+        sa_df = sa_raw.dropna(subset=["timestamp_ms", "ina_a_ma"])
+        sa_df = sa_df[sa_df["ina_a_ma"].abs() >= DEAD_CURRENT_THRESHOLD]
+
+        rms_stds_sa = [
+            np.std(sa_df["accel_rms"].values[s: s + WINDOW_SIZE])
+            for s in range(0, len(sa_df) - WINDOW_SIZE + 1, STEP_SIZE)
+        ]
+        rms_stds_cs = [
+            np.std(cs_df["accel_rms"].values[s: s + WINDOW_SIZE])
+            for s in range(0, len(cs_df) - WINDOW_SIZE + 1, STEP_SIZE)
+        ]
+
+        stats = [
+            ("cur mean (mA)",    sa_df["ina_a_ma"].mean(),      cs_df["ina_a_ma"].mean()),
+            ("cur std (mA)",     sa_df["ina_a_ma"].std(),       cs_df["ina_a_ma"].std()),
+            ("pwr mean (mW)",    sa_df["ina_a_mw"].mean(),      cs_df["ina_a_mw"].mean()),
+            ("accel_rms mean",   sa_df["accel_rms"].mean(),     cs_df["accel_rms"].mean()),
+            ("accel_rms_std/win",np.mean(rms_stds_sa) if rms_stds_sa else float("nan"),
+                                 np.mean(rms_stds_cs) if rms_stds_cs else float("nan")),
+        ]
+        first = True
+        for metric, sa_val, cs_val in stats:
+            cls_label = CLASS_NAMES[label] if first else ""
+            print(f"  {cls_label:<12}  {metric:<20}  {sa_val:>11.3f}  {cs_val:>13.3f}")
+            first = False
+        print("  " + "-" * 62)
+
+
+
+# ─── LOSO ─────────────────────────────────────────────────────────────────────
+def run_loso(output_dir):
+    """
+    2-fold Leave-One-Session-Out cross-validation.
+      Fold 1: Train = Session A  ->  Test = Session B
+      Fold 2: Train = Session B  ->  Test = Session A
+
+    Within each fold, purged blocked CV is run on the training session to
+    select the best model and feature variant — no information from the test
+    session leaks into that selection.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("\n" + "=" * 72)
+    print("  Leave-One-Session-Out (LOSO) — 2-Fold Cross-Session Evaluation")
+    print("=" * 72)
+
+    fold_metrics = []
+
+    for fold_num, (train_id, test_id) in enumerate([("A", "B"), ("B", "A")], start=1):
+        print(f"\n{'─' * 72}")
+        print(f"  Fold {fold_num}:  Train = Session {train_id}   |   Test = Session {test_id}")
+        print(f"{'─' * 72}")
+
+        # ── Load training session ─────────────────────────────────────────────
+        print(f"\n  Loading Session {train_id} (training)...")
+        train_raw = {}
+        for label, (fp, enc, keep) in SESSION_MAP[train_id].items():
+            train_raw[label] = load_session_file(fp, label, enc, keep)
+
+        # ── Load test session ─────────────────────────────────────────────────
+        print(f"\n  Loading Session {test_id} (test)...")
+        test_raw = {}
+        for label, (fp, enc, keep) in SESSION_MAP[test_id].items():
+            test_raw[label] = load_session_file(fp, label, enc, keep)
+
+        # ── Feature extraction on full sessions (no within-session split) ─────
+        X_train, y_train, train_meta = build_dataset(train_raw)
+        X_test,  y_test,  _          = build_dataset(test_raw)
+        print(
+            f"\n  Training matrix: {X_train.shape}  |  "
+            f"Test matrix: {X_test.shape}"
+        )
+        for lbl in sorted(SESSION_MAP[train_id]):
+            print(
+                f"    Class {lbl}: "
+                f"{np.sum(y_train == lbl)} train windows, "
+                f"{np.sum(y_test  == lbl)} test windows"
+            )
+
+        # ── Feature / model selection via purged blocked CV on training session
+        feature_variants = get_feature_variants(X_train.columns)
+        splits = make_purged_blocked_splits(train_meta, train_raw)
+        results = evaluate_development(
+            X_train, y_train, splits, feature_variants,
+            header=f"  Feature selection (purged CV on Session {train_id})..."
+        )
+        best = choose_best_result(results)
+        print(
+            f"\n  Best: {best['model_name']} / {best['variant']}  "
+            f"(CV macro-F1={best['cv_macro_f1'] * 100:.1f}%)"
+        )
+
+        # ── Train on full training session, predict on test session ───────────
+        model = clone(best["model"])
+        cols  = best["features"]
+        model.fit(X_train[cols], y_train)
+        X_test_aligned = X_test.reindex(columns=cols, fill_value=0)
+        y_pred = model.predict(X_test_aligned)
+
+        # ── Metrics ───────────────────────────────────────────────────────────
+        labels_present = sorted(np.unique(y_test))
+        target_names   = [CLASS_NAMES[l] for l in labels_present]
+        acc = accuracy_score(y_test, y_pred) * 100
+        f1  = f1_score(y_test, y_pred, average="macro", zero_division=0) * 100
+
+        print(f"\n  Fold {fold_num} result -> Acc={acc:.1f}%   Macro-F1={f1:.1f}%\n")
+        print(
+            classification_report(
+                y_test, y_pred,
+                labels=labels_present,
+                target_names=target_names,
+                zero_division=0,
+            )
+        )
+        print("  Confusion Matrix:")
+        print_confusion_matrix(y_test, y_pred, labels_present)
+
+        # ── Save confusion matrix figure ──────────────────────────────────────
+        cm       = confusion_matrix(y_test, y_pred, labels=labels_present)
+        fig_path = os.path.join(
+            output_dir, f"confusion_matrix_loso_fold{fold_num}.png"
+        )
+        _save_confusion_matrix_figure(
+            cm=cm,
+            labels=target_names,
+            title=(
+                f"LOSO Fold {fold_num}  —  "
+                f"Train: Session {train_id}  |  Test: Session {test_id}"
+            ),
+            filepath=fig_path,
+            acc=acc,
+            macro_f1=f1,
+            model_name=best["model_name"],
+            feature_variant=best["variant"],
+        )
+
+        fold_metrics.append(
+            {"fold": fold_num, "train": train_id, "test": test_id,
+             "acc": acc, "f1": f1}
+        )
+
+    # ── LOSO summary ─────────────────────────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  LOSO Summary")
+    print("=" * 72)
+    print(
+        f"\n  {'Fold':<8} {'Train':>9} {'Test':>8}  "
+        f"{'Accuracy':>9}  {'Macro-F1':>9}"
+    )
+    print("  " + "-" * 48)
+    for m in fold_metrics:
+        print(
+            f"  Fold {m['fold']:<3}   Session {m['train']:>1}   Session {m['test']:>1}   "
+            f"{m['acc']:>8.1f}%  {m['f1']:>8.1f}%"
+        )
+    avg_acc = np.mean([m["acc"] for m in fold_metrics])
+    avg_f1  = np.mean([m["f1"]  for m in fold_metrics])
+    print("  " + "-" * 48)
+    print(
+        f"  {'LOSO avg':<8} {'':>9} {'':>8}   "
+        f"{avg_acc:>8.1f}%  {avg_f1:>8.1f}%"
+    )
+    print(
+        f"\n  Interpretation:\n"
+        f"    LOSO average is the best available estimate of real-world\n"
+        f"    cross-session performance with only 2 sessions.\n"
+        f"    A final production model should train on ALL data (A + B combined)."
+    )
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
-def main():
+def main(mode="cross_session"):
     print("=" * 72)
     print("  NILM Pipeline - Leakage-Resistant Load Classification")
     print("=" * 72)
@@ -783,18 +1075,40 @@ def main():
         print("\n[7] Top 15 Random Forest features...")
         print_feature_importances(best_model, best["features"])
 
-    # ── Cross-session evaluation ──────────────────────────────────────────────
-    cross_data = load_cross_session_data()
-    evaluate_cross_session(best, X_dev, y_dev, cross_data)
-
-    print("\n" + "=" * 72)
-    print("  Pipeline complete.")
-    print(
-        "  Note: within-session test = later data from same recordings.\n"
-        "        Cross-session test  = separate recording (different session)."
-    )
-    print("=" * 72)
+    if mode == "cross_session":
+        # ── Cross-session evaluation (Original ~77% run) ───────────────────────
+        cross_data = load_cross_session_data()
+        evaluate_cross_session(best, X_dev, y_dev, cross_data, OUTPUT_DIR)
+        
+        print("\n" + "=" * 72)
+        print("  Pipeline complete.")
+        print(
+            "  Note: within-session test = later data from same recordings.\n"
+            f"        Cross-session test  = separate recording (different session).\n"
+            f"        Figures saved in    -> {OUTPUT_DIR}/"
+        )
+        print("=" * 72)
+    else:
+        # ── LOSO cross-session evaluation (Rigorous ~65% run) ──────────────────
+        run_loso(OUTPUT_DIR)
+        
+        print("\n" + "=" * 72)
+        print("  Pipeline complete.")
+        print(
+            "  Steps [1]-[7]: within-session baseline (Session A only).\n"
+            f"  LOSO section:  2-fold cross-session evaluation.\n"
+            f"  Figures saved in -> {OUTPUT_DIR}/"
+        )
+        print("=" * 72)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run the NILM pipeline")
+    parser.add_argument(
+        "--mode",
+        choices=["cross_session", "loso"],
+        default="cross_session",
+        help="Evaluation mode: 'cross_session' (A->B only, ~77%) or 'loso' (2-fold LOSO, ~65%)"
+    )
+    args = parser.parse_args()
+    main(mode=args.mode)

@@ -39,3 +39,7 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Generated Results
+results/
+*.png
