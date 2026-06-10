@@ -79,8 +79,10 @@ SESSION_MAP = {
     },
 }
 
-# Where to save output figures.
-OUTPUT_DIR = "results"
+# Where to save output figures and find data (robust to script location).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "..", "data")
+OUTPUT_DIR = os.path.join(BASE_DIR, "..", "results")
 
 CLASS_NAMES = {
     1: "unloaded",
@@ -153,8 +155,9 @@ def _largest_contiguous_segment(df):
 
 
 def load_and_clean(filepath, label, encoding="utf-8", keep_largest_segment=False):
+    full_path = os.path.join(DATA_DIR, filepath)
     df = pd.read_csv(
-        filepath, header=None, names=COLS, on_bad_lines="skip", encoding=encoding
+        full_path, header=None, names=COLS, on_bad_lines="skip", encoding=encoding
     )
     before_filter = len(df)
     df = _parse_and_filter(df, label)
@@ -187,8 +190,9 @@ def load_session_file(filepath, label, encoding="utf-8", keep_largest=False):
     (padding short rows with NaN and accepting up to 25 columns).
     We then slice the first 13 columns to match our expected schema.
     """
+    full_path = os.path.join(DATA_DIR, filepath)
     raw = pd.read_csv(
-        filepath, header=None, names=range(25), on_bad_lines="skip", encoding=encoding
+        full_path, header=None, names=range(25), on_bad_lines="skip", encoding=encoding
     )
     raw = raw.iloc[:, : len(COLS)]  # keep only the first 13 columns
     raw.columns = COLS
@@ -614,8 +618,9 @@ def load_cross_session_data():
     print("\n[A] Loading cross-session test data...")
     for label, (filepath, encoding) in CROSS_SESSION_MAP.items():
         # Read without fixed column names so extra trailing columns are tolerated
+        full_path = os.path.join(DATA_DIR, filepath)
         raw = pd.read_csv(
-            filepath, header=None, on_bad_lines="skip", encoding=encoding
+            full_path, header=None, on_bad_lines="skip", encoding=encoding
         )
         # Keep only the first 13 columns (our expected schema)
         raw = raw.iloc[:, : len(COLS)]
@@ -804,8 +809,9 @@ def evaluate_cross_session(best, X_dev, y_dev, cross_data, output_dir):
 
     for label in sorted(cross_data):
         cs_df = cross_data[label]
+        full_path = os.path.join(DATA_DIR, FILE_MAP[label])
         sa_raw = pd.read_csv(
-            FILE_MAP[label], header=None, names=COLS, on_bad_lines="skip", encoding="utf-8"
+            full_path, header=None, names=COLS, on_bad_lines="skip", encoding="utf-8"
         )
         for c in COLS:
             sa_raw[c] = pd.to_numeric(sa_raw[c], errors="coerce")
