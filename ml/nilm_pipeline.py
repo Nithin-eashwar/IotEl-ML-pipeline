@@ -1081,6 +1081,26 @@ def main(mode="cross_session"):
         print("\n[7] Top 15 Random Forest features...")
         print_feature_importances(best_model, best["features"])
 
+    # ── Export trained model for bridge/inference use ─────────────────────────
+    import pickle
+    model_path = os.path.join(BASE_DIR, "model.pkl")
+    with open(model_path, "wb") as f:
+        pickle.dump(
+            {
+                "model": best_model,           # already fitted on full dev set
+                "feature_cols": best["features"],
+                "class_names": CLASS_NAMES,    # {1: "unloaded", 2: ..., 4: "stall"}
+                "window_size": WINDOW_SIZE,
+                "step_size": STEP_SIZE,
+                "variant": best["variant"],
+                "model_name": best["model_name"],
+            },
+            f,
+        )
+    print(f"\n  [✓] Model exported -> {model_path}")
+    print(f"      Variant : {best['variant']}  ({len(best['features'])} features)")
+    print(f"      Model   : {best['model_name']}")
+
     if mode == "cross_session":
         # ── Cross-session evaluation (Original ~77% run) ───────────────────────
         cross_data = load_cross_session_data()

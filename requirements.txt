@@ -3,3 +3,6 @@ pandas
 scipy
 scikit-learn
 matplotlib
+pyserial
+azure-iot-device
+python-dotenv

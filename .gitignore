@@ -43,3 +43,6 @@ desktop.ini
 # Generated Results
 results/
 *.png
+
+# Environment / secrets — NEVER commit this
+.env
