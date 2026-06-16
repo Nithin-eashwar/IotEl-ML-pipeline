@@ -43,6 +43,7 @@ desktop.ini
 # Generated Results
 results/
 *.png
+*.pkl
 
 # Environment / secrets — NEVER commit this
 .env

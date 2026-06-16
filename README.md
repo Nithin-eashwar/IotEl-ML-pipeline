@@ -11,7 +11,8 @@ The pipeline classifies motor operating states — `unloaded`, `light_load`, `he
 ```
 IotEl/
 ├── ml/
-│   └── nilm_pipeline.py          # Main ML pipeline (run this)
+│   ├── nilm_pipeline.py          # Main ML pipeline (run this)
+│   └── model.pkl                 # Saved model — auto-generated after each run
 │
 ├── data/                         # CSV dataset files (NOT in git — see below)
 │   ├── class1_unloaded__1_.csv
@@ -140,12 +141,52 @@ Runs two folds (A→B and B→A), averaging the results. This is the most rigoro
 [5]  Within-session held-out test
 [6]  Detailed classification report + text confusion matrix
 [7]  Top-15 Random Forest feature importances
+       • Trained model serialised → ml/model.pkl
 
 [A–D] Cross-session evaluation sections (the honest numbers)
        • Per-class window accuracy on unseen session data
        • Matplotlib confusion matrix saved to results/
        • Signal statistics comparison between sessions
 ```
+
+---
+
+## Saved Model (`ml/model.pkl`)
+
+After every run the best model is automatically saved to `ml/model.pkl`. The file is a Python `pickle` containing a dictionary with:
+
+| Key | Type | Description |
+|---|---|---|
+| `model` | scikit-learn `Pipeline` | Fitted classifier (RF or KNN + scaler) |
+| `feature_cols` | `list[str]` | Feature columns the model expects |
+| `class_names` | `dict` | `{1: "unloaded", 2: "light_load", 3: "heavy_load", 4: "stall"}` |
+| `window_size` | `int` | Samples per window (default 128) |
+| `step_size` | `int` | Window step size (default 64) |
+| `variant` | `str` | Feature variant name selected by CV |
+| `model_name` | `str` | `"Random Forest"` or `"KNN"` |
+
+### Loading and using the model
+
+```python
+import pickle
+from ml.nilm_pipeline import extract_window_features
+import pandas as pd
+
+with open("ml/model.pkl", "rb") as f:
+    saved = pickle.load(f)
+
+model       = saved["model"]
+feature_cols = saved["feature_cols"]
+class_names  = saved["class_names"]
+
+# --- build a feature row from a 128-row sensor DataFrame window ---
+feats = extract_window_features(window_df)          # window_df: 128 rows
+X     = pd.DataFrame([feats])[feature_cols]         # select & order cols
+pred  = model.predict(X)[0]                         # integer label (1–4)
+print(class_names[pred])                            # e.g. "heavy_load"
+```
+
+> **Note:** `ml/model.pkl` is excluded from version control (see `.gitignore`). Re-run the pipeline to regenerate it.
 
 ---
 

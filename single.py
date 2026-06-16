@@ -195,84 +195,168 @@ def build_payload(window_rows: list, bundle: dict) -> dict:
 
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
-def main():
-    bundle = load_model(MODEL_PATH)
+def _run_loop(row_source, bundle, client, send: bool = True):
+    """
+    Core inference + send loop — shared by both live (serial) and test (CSV) modes.
+    row_source: an iterable that yields raw CSV line strings one at a time.
+    """
     window_size = bundle["window_size"]   # 128
     step_size   = bundle["step_size"]     # 64
 
-    # Connect to Azure IoT Hub
-    print("\nConnecting to Azure IoT Hub...")
-    client = IoTHubDeviceClient.create_from_connection_string(CONNECTION_STRING)
-    client.connect()
-    print("[✓] Connected to Azure IoT Hub\n")
-
-    # Open the serial port
-    print(f"Opening serial port {COM_PORT} at {BAUD_RATE} baud...")
-    try:
-        ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=2)
-    except serial.SerialException as e:
-        print(f"[ERROR] Could not open {COM_PORT}: {e}")
-        print("  Check the port name and make sure the ESP32 is connected.")
-        client.disconnect()
-        sys.exit(1)
-    print(f"[✓] Serial port open. Waiting for sensor data...\n")
-
-    # Rolling buffer — holds up to window_size rows
-    buffer = deque(maxlen=window_size)
+    buffer               = deque(maxlen=window_size)
     rows_since_last_send = 0
-    total_windows_sent = 0
+    total_windows_sent   = 0
 
-    try:
-        while True:
-            raw = ser.readline()
-            if not raw:
-                continue
+    for raw_line in row_source:
+        row = parse_row(raw_line)
+        if row is None:
+            if raw_line.strip().startswith("#"):
+                print(raw_line.strip())   # show firmware init messages
+            continue
 
-            try:
-                line = raw.decode("utf-8", errors="replace")
-            except Exception:
-                continue
+        buffer.append(row)
+        rows_since_last_send += 1
 
-            row = parse_row(line)
-            if row is None:
-                # Print firmware init messages so we can see sensor status
-                if raw.decode("utf-8", errors="replace").startswith("#"):
-                    print(raw.decode("utf-8", errors="replace").strip())
-                continue
+        if len(buffer) == window_size and rows_since_last_send >= step_size:
+            rows_since_last_send = 0
+            payload = build_payload(list(buffer), bundle)
 
-            buffer.append(row)
-            rows_since_last_send += 1
-
-            # Once we have a full window AND have accumulated step_size new rows
-            if len(buffer) == window_size and rows_since_last_send >= step_size:
-                rows_since_last_send = 0
-                window_rows = list(buffer)
-
-                # Run inference and build payload
-                payload = build_payload(window_rows, bundle)
-
-                # Send to Azure IoT Hub
+            if send:
                 msg = Message(json.dumps(payload))
                 msg.content_encoding = "utf-8"
                 msg.content_type = "application/json"
                 client.send_message(msg)
 
-                total_windows_sent += 1
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(
-                    f"[{ts}] Window #{total_windows_sent:04d}  "
-                    f"→ {payload['class_name']:12s}  "
-                    f"conf={payload['confidence']:5.1f}%  "
-                    f"status={payload['status']}"
-                )
+            total_windows_sent += 1
+            ts = datetime.now().strftime("%H:%M:%S")
+            sent_flag = "" if send else "  [NOT SENT — --no-send mode]"
+            print(
+                f"[{ts}] Window #{total_windows_sent:04d}  "
+                f"→ {payload['status']:8s} | {payload['status_message']}{sent_flag}"
+            )
+
+    print(f"\n  Done. {total_windows_sent} windows processed.")
+
+
+def _csv_row_source(csv_path: str, speed: float = 1.0):
+    """
+    Yields lines from a CSV file, optionally throttled to simulate real-time.
+    speed=1.0  → real 100 Hz (10 ms per row)
+    speed=10.0 → 10× faster (1 ms per row)
+    speed=0    → as fast as possible (no sleep)
+    """
+    delay = (1.0 / 100.0) / speed if speed > 0 else 0   # seconds per row
+
+    print(f"  Replaying: {csv_path}")
+    print(f"  Speed    : {speed}× real-time  ({delay * 1000:.1f} ms / row)\n")
+
+    with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            yield line
+            if delay:
+                time.sleep(delay)
+
+
+def _serial_row_source(com_port: str, baud_rate: int):
+    """Yields lines from a live serial port indefinitely."""
+    try:
+        ser = serial.Serial(com_port, baud_rate, timeout=2)
+    except serial.SerialException as e:
+        print(f"[ERROR] Could not open {com_port}: {e}")
+        print("  Check the port name and make sure the ESP32 is connected.")
+        sys.exit(1)
+
+    print(f"[✓] Serial port open ({com_port}). Waiting for sensor data...\n")
+    try:
+        while True:
+            raw = ser.readline()
+            if raw:
+                yield raw.decode("utf-8", errors="replace")
+    finally:
+        ser.close()
+        print("Serial port closed.")
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="NILM bridge — send ML predictions to Azure IoT Hub"
+    )
+    parser.add_argument(
+        "--test",
+        metavar="CSV_FILE",
+        default=None,
+        help=(
+            "Run in test mode: replay a CSV from the data/ folder instead of "
+            "reading live from the serial port. "
+            "Example: --test 4_stall_test.csv"
+        ),
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=5.0,
+        help=(
+            "Replay speed multiplier (test mode only). "
+            "1.0 = real-time 100 Hz, 10.0 = 10× faster, 0 = no delay. "
+            "Default: 5.0"
+        ),
+    )
+    parser.add_argument(
+        "--no-send",
+        action="store_true",
+        help="Run inference but do NOT send anything to Azure (dry-run).",
+    )
+    args = parser.parse_args()
+
+    bundle = load_model(MODEL_PATH)
+
+    # Connect to Azure (skipped in --no-send mode)
+    client = None
+    if not args.no_send:
+        print("\nConnecting to Azure IoT Hub...")
+        client = IoTHubDeviceClient.create_from_connection_string(CONNECTION_STRING)
+        client.connect()
+        print("[✓] Connected to Azure IoT Hub")
+    else:
+        print("\n[--no-send] Dry-run mode — inference only, nothing sent to Azure.")
+
+    print()
+
+    try:
+        if args.test:
+            # ── Test / replay mode ────────────────────────────────────────────
+            csv_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "data", args.test
+            )
+            if not os.path.exists(csv_path):
+                print(f"[ERROR] Test file not found: {csv_path}")
+                print(f"  Available files in data/:")
+                for f in os.listdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")):
+                    if f.endswith(".csv"):
+                        print(f"    {f}")
+                sys.exit(1)
+            row_source = _csv_row_source(csv_path, speed=args.speed)
+        else:
+            # ── Live serial mode ──────────────────────────────────────────────
+            if COM_PORT == "COM_PORT_PLACEHOLDER":
+                print("[ERROR] COM_PORT is not set.")
+                print("  Edit single.py and set COM_PORT to your ESP32 port.")
+                print("  Run:  python -m serial.tools.list_ports")
+                sys.exit(1)
+            print(f"Opening serial port {COM_PORT} at {BAUD_RATE} baud...")
+            row_source = _serial_row_source(COM_PORT, BAUD_RATE)
+
+        _run_loop(row_source, bundle, client, send=not args.no_send)
 
     except KeyboardInterrupt:
         print("\n\nStopping bridge...")
 
     finally:
-        ser.close()
-        client.disconnect()
-        print("Serial port closed. Disconnected from Azure IoT Hub.")
+        if client:
+            client.disconnect()
+            print("Disconnected from Azure IoT Hub.")
 
 
 if __name__ == "__main__":
