@@ -79,7 +79,7 @@
 
 /* ---------- Motor -------------------------------------------------- */
 
-#define MOTOR_TARGET_RPM    600.0f
+#define MOTOR_TARGET_RPM    150.0f
 #define MOTOR_STEPS_PER_REV 200             /* NEMA 17  1.8 °/step */
 #define MICROSTEP_MODE      1               /* MS1/MS2/MS3 tied to GND */
 #define STEP_PIN            GPIO_NUM_25     /* RMT TX channel */
@@ -119,15 +119,11 @@
 #define SAS_REFRESH_SEC     3300            /* 55 min */
 #define SAS_TOKEN_BUF_LEN   512
 
-/* Vibration  —  rolling RMS ring buffer.  Reads one ADXL345 sample
- * per sensor iteration to avoid blocking the task. */
-#define RMS_BUF_SIZE        20
-
 /* NILM model windowing must match ml/nilm_pipeline.py. */
 #define NILM_WINDOW_SIZE    128
 #define NILM_STEP_SIZE      64
 #define NILM_SAMPLE_RATE_HZ 100.0f
-#define MOTOR_SUPPLY_V      12.0f
+#define NILM_DEAD_CURRENT_MA 2.0f
 
 /* ================================================================== */
 /*  DATA STRUCTURES                                                    */
@@ -451,6 +447,7 @@ static ml_result_t nilm_result_from_class(int class_id, float confidence)
 static ml_result_t ml_infer_window(sensor_features_t f, float ax, float ay,
                                    float az)
 {
+    float mw = ina219_read_power_mw(INA219_A_ADDR);
     nilm_sample_t sample = {
         .accel_x = isnan(ax) ? 0.0f : ax,
         .accel_y = isnan(ay) ? 0.0f : ay,
@@ -458,10 +455,12 @@ static ml_result_t ml_infer_window(sensor_features_t f, float ax, float ay,
         .accel_rms = f.vibration_rms,
         .tmp117_c = f.ambient_temperature,
         .ntc_c = f.temperature,
-        .ina_a_ma = f.current * 1000.0f,
-        .ina_a_mw = f.current * MOTOR_SUPPLY_V * 1000.0f,
+        .ina_a_ma = f.phase_a_current * 1000.0f,
+        .ina_a_mw = isnan(mw) ? 0.0f : mw,
     };
-    nilm_window_add(&g_nilm_window, sample);
+    if (fabsf(sample.ina_a_ma) >= NILM_DEAD_CURRENT_MA) {
+        nilm_window_add(&g_nilm_window, sample);
+    }
 
     if (g_nilm_window.count < NILM_WINDOW_SIZE) {
         g_nilm_window.last_result = ml_infer(f);
@@ -563,8 +562,8 @@ static void ina219_init_one(uint8_t addr)
     uint8_t cfg[] = {0x00, 0x39, 0x9F};
     i2c_master_write_to_device(I2C_MASTER_PORT, addr, cfg, 3,
                                pdMS_TO_TICKS(100));
-    /* Cal reg:  0.1 Ω shunt, 3.2 A max  → LSB = 100 µA */
-    uint8_t cal[] = {0x05, 0x0F, 0xD2};
+    /* Cal reg:  0.1 Ω shunt, 3.2 A max  → LSB = 100 µA, Power_LSB = 2 mW */
+    uint8_t cal[] = {0x05, 0x10, 0x00};
     i2c_master_write_to_device(I2C_MASTER_PORT, addr, cal, 3,
                                pdMS_TO_TICKS(100));
 }
@@ -583,6 +582,15 @@ static float ina219_read_current(uint8_t addr)
     return v * 0.0001f;             /* 100 µA/LSB → A */
 }
 
+static float ina219_read_power_mw(uint8_t addr)
+{
+    uint8_t raw[2];
+    if (i2c_read_bytes(addr, 0x03, raw, 2) != ESP_OK) return NAN;
+    int16_t v = (int16_t)((raw[0] << 8) | raw[1]);
+    /* Power_LSB = 20 × Current_LSB = 2 mW/LSB when Cal=4096. */
+    return v * 2.0f;
+}
+
 /* ---- ADXL345 (I2C 0x53)  ----------------------------------------- */
 
 static void adxl345_init(void)
@@ -599,9 +607,9 @@ static void adxl345_read_raw(float *x, float *y, float *z)
         *x = *y = *z = NAN;
         return;
     }
-    *x = (int16_t)(raw[0] | (raw[1] << 8)) * 0.0039f;
-    *y = (int16_t)(raw[2] | (raw[3] << 8)) * 0.0039f;
-    *z = (int16_t)(raw[4] | (raw[5] << 8)) * 0.0039f;
+    *x = (int16_t)(raw[0] | (raw[1] << 8)) * 0.0039f * 9.81f;
+    *y = (int16_t)(raw[2] | (raw[3] << 8)) * 0.0039f * 9.81f;
+    *z = (int16_t)(raw[4] | (raw[5] << 8)) * 0.0039f * 9.81f;
 }
 
 /* ================================================================== */
@@ -837,11 +845,6 @@ static void vSensorTask(void *pv)
     adxl345_init();
     ina219_init();
 
-    /* ---- Rolling vibration RMS buffer (non‑blocking) ------------- */
-    float   rms_buf[RMS_BUF_SIZE] = {0};
-    uint8_t rms_idx               = 0;
-    uint8_t rms_count             = 0;
-
     TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
@@ -858,25 +861,17 @@ static void vSensorTask(void *pv)
         if (isnan(f.phase_a_current))     f.phase_a_current     = 0.0f;
         if (isnan(f.phase_b_current))     f.phase_b_current     = 0.0f;
 
-        float phase_a_abs = fabsf(f.phase_a_current);
-        float phase_b_abs = fabsf(f.phase_b_current);
-        f.current = phase_a_abs > phase_b_abs ? phase_a_abs : phase_b_abs;
+        /* INA219‑A only — pinned to match training. */
+        f.current = fabsf(f.phase_a_current);
 
-        /* ---- Vibration  (one ADXL345 sample per iteration) ------- */
+        /* ---- Vibration  (instantaneous RMS, matching training) ---- */
         float ax, ay, az;
         adxl345_read_raw(&ax, &ay, &az);
         if (!isnan(ax)) {
-            /* Remove 1 g DC from Z, keep AC magnitude squared */
-            float m2 = ax * ax + ay * ay + (az - 1.0f) * (az - 1.0f);
-            rms_buf[rms_idx] = m2;
-            rms_idx = (rms_idx + 1) % RMS_BUF_SIZE;
-            if (rms_count < RMS_BUF_SIZE) rms_count++;
+            f.vibration_rms = sqrtf(ax * ax + ay * ay + az * az);
+        } else {
+            f.vibration_rms = 0.0f;
         }
-
-        /* Compute RMS from the rolling window */
-        float sq_sum = 0.0f;
-        for (uint8_t i = 0; i < rms_count; i++) sq_sum += rms_buf[i];
-        f.vibration_rms = (rms_count > 0) ? sqrtf(sq_sum / rms_count) : 0.0f;
 
         /* ---- RPM (atomic read — no mutex needed) ----------------- */
         f.rpm = atomic_load(&g_effective_rpm);
