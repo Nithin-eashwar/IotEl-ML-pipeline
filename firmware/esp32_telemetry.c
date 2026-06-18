@@ -9,9 +9,9 @@
  *   sas_refresh  — background HMAC‑SHA256 SAS token generator (55‑min cycle)
  *
  * Hardware:
- *   NEMA 17 stepper + A4988 driver (STEP/DIR/ENABLE/MSx + RMT channel)
+ *   NEMA 17 stepper + A4988 driver (STEP/DIR/ENABLE + RMT channel)
  *   TMP117  (I2C 0x48) — ±0.1 °C temperature
- *   INA219  (I2C 0x40) — current (0.1 Ω shunt)
+ *   INA219A (I2C 0x40) + INA219B (I2C 0x41) — phase current
  *   ADXL345 (I2C 0x53) — 3‑axis accelerometer (vibration RMS)
  *
  * Credentials — paste from dashboard after device registration:
@@ -48,6 +48,7 @@
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
+#include "driver/adc.h"
 
 #include "mqtt_client.h"
 
@@ -80,13 +81,10 @@
 
 #define MOTOR_TARGET_RPM    600.0f
 #define MOTOR_STEPS_PER_REV 200             /* NEMA 17  1.8 °/step */
-#define MICROSTEP_MODE      8               /* 1/8  → 1600 microsteps/rev */
-#define MS1_PIN             GPIO_NUM_26
-#define MS2_PIN             GPIO_NUM_27
-#define MS3_PIN             GPIO_NUM_14
-#define STEP_PIN            GPIO_NUM_32     /* RMT TX channel */
-#define DIR_PIN             GPIO_NUM_33
-#define ENABLE_PIN          GPIO_NUM_25     /* A4988 ENABLE  active‑low */
+#define MICROSTEP_MODE      1               /* MS1/MS2/MS3 tied to GND */
+#define STEP_PIN            GPIO_NUM_25     /* RMT TX channel */
+#define DIR_PIN             GPIO_NUM_26
+#define ENABLE_PIN          GPIO_NUM_27     /* A4988 ENABLE  active-low */
 
 /* Minimum step period that guarantees A4988 1 µs pulse within 1 MHz RMT
  * resolution:  2 µs high + 1 µs low  =  3 µs  (~333 k steps/s  max) */
@@ -101,7 +99,17 @@
 
 #define ADXL345_ADDR        0x53
 #define TMP117_ADDR         0x48
-#define INA219_ADDR         0x40
+#define INA219_A_ADDR       0x40
+#define INA219_B_ADDR       0x41
+
+/* ---------- NTC ADC ------------------------------------------------ */
+
+#define NTC_ADC_CHANNEL     ADC1_CHANNEL_6  /* GPIO34 */
+#define NTC_NOMINAL_R       10000.0f
+#define NTC_NOMINAL_T_C     25.0f
+#define NTC_BETA            3950.0f
+#define NTC_SERIES_R        10000.0f
+#define ADC_MAX_COUNTS      4095.0f
 
 /* ---------- Timing ------------------------------------------------- */
 
@@ -127,9 +135,12 @@
 
 typedef struct {
     float rpm;
-    float temperature;
+    float temperature;         /* Motor/contact temperature from NTC */
+    float ambient_temperature; /* Ambient temperature from TMP117 */
     float vibration_rms;
     float current;
+    float phase_a_current;
+    float phase_b_current;
 } sensor_features_t;
 
 typedef struct {
@@ -445,7 +456,7 @@ static ml_result_t ml_infer_window(sensor_features_t f, float ax, float ay,
         .accel_y = isnan(ay) ? 0.0f : ay,
         .accel_z = isnan(az) ? 0.0f : az,
         .accel_rms = f.vibration_rms,
-        .tmp117_c = f.temperature,
+        .tmp117_c = f.ambient_temperature,
         .ntc_c = f.temperature,
         .ina_a_ma = f.current * 1000.0f,
         .ina_a_mw = f.current * MOTOR_SUPPLY_V * 1000.0f,
@@ -523,24 +534,51 @@ static float tmp117_read(void)
     return v * 0.0078125f;          /* 7.8125 m°C/LSB → °C */
 }
 
-/* ---- INA219 (I2C 0x40)  ------------------------------------------ */
+/* ---- NTC 10k thermistor (GPIO34 / ADC1_CH6)  --------------------- */
 
-static void ina219_init(void)
+static void ntc_init(void)
+{
+    ESP_ERROR_CHECK(adc1_config_width(ADC_WIDTH_BIT_12));
+    ESP_ERROR_CHECK(adc1_config_channel_atten(NTC_ADC_CHANNEL, ADC_ATTEN_DB_11));
+}
+
+static float ntc_read(void)
+{
+    int raw = adc1_get_raw(NTC_ADC_CHANNEL);
+    if (raw <= 0 || raw >= (int)ADC_MAX_COUNTS) return NAN;
+
+    float ratio = (float)raw / ADC_MAX_COUNTS;
+    float r_ntc = NTC_SERIES_R * ratio / (1.0f - ratio);
+    float t0_k  = NTC_NOMINAL_T_C + 273.15f;
+    float t_k   = 1.0f / (1.0f / t0_k + (1.0f / NTC_BETA)
+                  * logf(r_ntc / NTC_NOMINAL_R));
+    return t_k - 273.15f;
+}
+
+/* ---- INA219 (I2C 0x40 / 0x41)  ----------------------------------- */
+
+static void ina219_init_one(uint8_t addr)
 {
     /* Config reg:  16 V bus, ±3.2 A range, 12‑bit, 128‑sample avg */
     uint8_t cfg[] = {0x00, 0x39, 0x9F};
-    i2c_master_write_to_device(I2C_MASTER_PORT, INA219_ADDR, cfg, 3,
+    i2c_master_write_to_device(I2C_MASTER_PORT, addr, cfg, 3,
                                pdMS_TO_TICKS(100));
     /* Cal reg:  0.1 Ω shunt, 3.2 A max  → LSB = 100 µA */
     uint8_t cal[] = {0x05, 0x0F, 0xD2};
-    i2c_master_write_to_device(I2C_MASTER_PORT, INA219_ADDR, cal, 3,
+    i2c_master_write_to_device(I2C_MASTER_PORT, addr, cal, 3,
                                pdMS_TO_TICKS(100));
 }
 
-static float ina219_read_current(void)
+static void ina219_init(void)
+{
+    ina219_init_one(INA219_A_ADDR);
+    ina219_init_one(INA219_B_ADDR);
+}
+
+static float ina219_read_current(uint8_t addr)
 {
     uint8_t raw[2];
-    if (i2c_read_bytes(INA219_ADDR, 0x04, raw, 2) != ESP_OK) return NAN;
+    if (i2c_read_bytes(addr, 0x04, raw, 2) != ESP_OK) return NAN;
     int16_t v = (int16_t)((raw[0] << 8) | raw[1]);
     return v * 0.0001f;             /* 100 µA/LSB → A */
 }
@@ -695,7 +733,7 @@ static void sas_refresh_task(void *pv)
 
 static void step_start(float rpm)
 {
-    uint32_t sprev = MOTOR_STEPS_PER_REV * MICROSTEP_MODE;   /* 1600     */
+    uint32_t sprev = MOTOR_STEPS_PER_REV * MICROSTEP_MODE;
     float    sps   = (rpm * (float)sprev) / 60.0f;           /* steps/s  */
     uint32_t per   = (uint32_t)(1000000.0f / sps);           /* µs/step  */
 
@@ -728,23 +766,17 @@ static void step_start(float rpm)
 
 static void motor_init(void)
 {
-    /* ---- GPIO: MSx, DIR, ENABLE --------------------------------- */
+    /* ---- GPIO: DIR, ENABLE -------------------------------------- */
     gpio_config_t io = {
         .mode         = GPIO_MODE_OUTPUT,
         .intr_type    = GPIO_INTR_DISABLE,
         .pin_bit_mask = (1ULL << DIR_PIN)
-                      | (1ULL << ENABLE_PIN)
-                      | (1ULL << MS1_PIN)
-                      | (1ULL << MS2_PIN)
-                      | (1ULL << MS3_PIN),
+                      | (1ULL << ENABLE_PIN),
     };
     gpio_config(&io);
 
     gpio_set_level(DIR_PIN,    1);          /* CW                      */
     gpio_set_level(ENABLE_PIN, 0);          /* A4988  active‑low       */
-    gpio_set_level(MS1_PIN,    1);          /* 1/8:  MS1=H, MS2=H, MS3=L */
-    gpio_set_level(MS2_PIN,    1);          /* Change these to reconfigure  */
-    gpio_set_level(MS3_PIN,    0);          /* microstepping mode later    */
 
     /* ---- RMT TX channel for STEP_PIN ---------------------------- */
     rmt_tx_channel_config_t tx = {
@@ -801,6 +833,7 @@ static void vMotorTask(void *pv)
 
 static void vSensorTask(void *pv)
 {
+    ntc_init();
     adxl345_init();
     ina219_init();
 
@@ -814,9 +847,20 @@ static void vSensorTask(void *pv)
     while (1) {
         sensor_features_t f = {0};
 
-        /* ---- Temperature + current  (single I2C reads) ----------- */
-        f.temperature = tmp117_read();
-        f.current     = ina219_read_current();
+        /* ---- Temperature + current  (single sensor reads) -------- */
+        f.ambient_temperature = tmp117_read();
+        f.temperature         = ntc_read();
+        f.phase_a_current     = ina219_read_current(INA219_A_ADDR);
+        f.phase_b_current     = ina219_read_current(INA219_B_ADDR);
+
+        if (isnan(f.ambient_temperature)) f.ambient_temperature = 0.0f;
+        if (isnan(f.temperature))         f.temperature         = 0.0f;
+        if (isnan(f.phase_a_current))     f.phase_a_current     = 0.0f;
+        if (isnan(f.phase_b_current))     f.phase_b_current     = 0.0f;
+
+        float phase_a_abs = fabsf(f.phase_a_current);
+        float phase_b_abs = fabsf(f.phase_b_current);
+        f.current = phase_a_abs > phase_b_abs ? phase_a_abs : phase_b_abs;
 
         /* ---- Vibration  (one ADXL345 sample per iteration) ------- */
         float ax, ay, az;
@@ -838,9 +882,8 @@ static void vSensorTask(void *pv)
         f.rpm = atomic_load(&g_effective_rpm);
 
         /* ---- Guard against NaN ----------------------------------- */
-        if (isnan(f.temperature))   f.temperature   = 0.0f;
-        if (isnan(f.current))       f.current       = 0.0f;
-        if (isnan(f.vibration_rms)) f.vibration_rms = 0.0f;
+        if (isnan(f.current))             f.current             = 0.0f;
+        if (isnan(f.vibration_rms))       f.vibration_rms       = 0.0f;
 
         /* ---- NILM inference over a rolling 128-sample window ------ */
         ml_result_t ml = ml_infer_window(f, ax, ay, az);
@@ -952,23 +995,29 @@ static void vAzureTask(void *pv)
 
             telemetry_packet_t pkt;
             if (xQueuePeek(g_telemetry_queue, &pkt, 0) == pdTRUE) {
-                char payload[512];
+                char payload[768];
                 int  n = snprintf(payload, sizeof(payload),
                     "{"
                     "\"device_id\":\"%s\","
                     "\"timestamp\":\"%s\","
                     "\"rpm\":%.1f,"
                     "\"temperature\":%.1f,"
+                    "\"ambient_temperature\":%.1f,"
                     "\"vibration\":%.2f,"
                     "\"current\":%.2f,"
+                    "\"phase_a_current\":%.2f,"
+                    "\"phase_b_current\":%.2f,"
                     "\"status\":\"%s\","
                     "\"status_message\":\"%s\""
                     "}",
                     DEVICE_ID, pkt.timestamp,
                     pkt.features.rpm,
                     pkt.features.temperature,
+                    pkt.features.ambient_temperature,
                     pkt.features.vibration_rms,
                     pkt.features.current,
+                    pkt.features.phase_a_current,
+                    pkt.features.phase_b_current,
                     pkt.ml.status,
                     pkt.ml.status_message);
 
@@ -982,10 +1031,14 @@ static void vAzureTask(void *pv)
                         esp_mqtt_client_stop(g_mqtt_client);
                         connected = false;
                     } else {
-                        ESP_LOGI(TAG, "→ Azure  |  status=%-8s  temp=%.1f °C  "
-                                 "vib=%.2f g   cur=%.2f A   rpm=%.0f",
+                        ESP_LOGI(TAG, "→ Azure  |  status=%-8s  ntc=%.1f °C  "
+                                 "amb=%.1f °C  vib=%.2f g   cur=%.2f A   "
+                                 "ia=%.2f A   ib=%.2f A   rpm=%.0f",
                                  pkt.ml.status, pkt.features.temperature,
+                                 pkt.features.ambient_temperature,
                                  pkt.features.vibration_rms, pkt.features.current,
+                                 pkt.features.phase_a_current,
+                                 pkt.features.phase_b_current,
                                  pkt.features.rpm);
                     }
                 }
