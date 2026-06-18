@@ -536,7 +536,10 @@ def _c_string(value):
 def _format_float(value):
     if not np.isfinite(value):
         return "0.0f"
-    return f"{float(value):.9g}f"
+    s = f"{float(value):.9g}"
+    if "." not in s:
+        s += ".0"
+    return s + "f"
 
 
 def export_random_forest_firmware(model, feature_cols, class_names, output_dir):
