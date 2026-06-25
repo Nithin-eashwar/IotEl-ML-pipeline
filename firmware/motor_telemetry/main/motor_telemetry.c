@@ -19,7 +19,7 @@
  *   DEVICE_ID     = "nema17-bay3-abc123"
  *   PRIMARY_KEY  = "base64‑encoded‑device‑key"
  *
- * Build with ESP‑IDF >= 5.0:
+ * Build with ESP‑IDF >= 6.0:
  *   idf.py create-project motor_telemetry
  *   cp esp32_telemetry.c nilm_model.* motor_telemetry/main/
  *   idf.py set-target esp32
@@ -45,15 +45,15 @@
 #include "esp_sntp.h"
 #include "nvs_flash.h"
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
-#include "driver/adc.h"
+#include "esp_adc/adc_oneshot.h"
 
 #include "mqtt_client.h"
 
-#include "mbedtls/md.h"
 #include "mbedtls/base64.h"
+#include "psa/crypto.h"
 
 #ifndef __has_include
 #define __has_include(x) 0
@@ -104,7 +104,7 @@
 
 /* ---------- NTC ADC ------------------------------------------------ */
 
-#define NTC_ADC_CHANNEL     ADC1_CHANNEL_6  /* GPIO34 */
+#define NTC_ADC_CHANNEL     ADC_CHANNEL_6   /* GPIO34 */
 #define NTC_NOMINAL_R       10000.0f
 #define NTC_NOMINAL_T_C     25.0f
 #define NTC_BETA            3950.0f
@@ -181,8 +181,9 @@ static char             g_sas_token[SAS_TOKEN_BUF_LEN];
 static bool             g_sas_valid = false;
 static SemaphoreHandle_t g_sas_mutex = NULL;
 
-/* ---- Effective RPM (atomic — written by motor ISR, read by sensors) */
-static atomic_float g_effective_rpm = ATOMIC_VAR_INIT(0.0f);
+/* ---- Effective RPM (protected by a spinlock — atomic_float is not C11) */
+static float             g_effective_rpm     = 0.0f;
+static portMUX_TYPE      g_rpm_mux           = portMUX_INITIALIZER_UNLOCKED;
 
 /* ---- Sensor state (mutex‑protected) */
 static sensor_features_t g_sensors   = {0};
@@ -203,6 +204,12 @@ static esp_mqtt_client_handle_t g_mqtt_client = NULL;
 
 /* ---- Telemetry queue */
 static QueueHandle_t g_telemetry_queue = NULL;
+
+/* ---- I2C master bus handle (IDF 6 new driver) */
+static i2c_master_bus_handle_t g_i2c_bus = NULL;
+
+/* ---- ADC oneshot handle (IDF 6 new driver) */
+static adc_oneshot_unit_handle_t g_adc_handle = NULL;
 
 /* ================================================================== */
 /*  ML INFERENCE HOOK                                                  */
@@ -444,6 +451,9 @@ static ml_result_t nilm_result_from_class(int class_id, float confidence)
     }
 }
 
+/* Forward declarations for INA219 functions used by ml_infer_window */
+static float ina219_read_power_mw(uint8_t addr);
+
 static ml_result_t ml_infer_window(sensor_features_t f, float ax, float ay,
                                    float az)
 {
@@ -497,30 +507,45 @@ static ml_result_t ml_infer_window(sensor_features_t f, float ax, float ay,
 
 static void i2c_init(void)
 {
-    i2c_config_t conf = {
-        .mode             = I2C_MODE_MASTER,
-        .sda_io_num       = I2C_MASTER_SDA,
-        .scl_io_num       = I2C_MASTER_SCL,
-        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ,
+    i2c_master_bus_config_t cfg = {
+        .clk_source                     = I2C_CLK_SRC_DEFAULT,
+        .i2c_port                       = I2C_MASTER_PORT,
+        .scl_io_num                     = I2C_MASTER_SCL,
+        .sda_io_num                     = I2C_MASTER_SDA,
+        .glitch_ignore_cnt              = 7,
+        .flags.enable_internal_pullup   = true,
     };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_PORT, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_PORT, conf.mode, 0, 0, 0));
+    ESP_ERROR_CHECK(i2c_new_master_bus(&cfg, &g_i2c_bus));
 }
 
 static esp_err_t i2c_write_byte(uint8_t addr, uint8_t reg, uint8_t val)
 {
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr,
+        .scl_speed_hz    = I2C_MASTER_FREQ,
+    };
+    i2c_master_dev_handle_t dev;
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev));
     uint8_t buf[2] = {reg, val};
-    return i2c_master_write_to_device(I2C_MASTER_PORT, addr, buf, 2,
-                                      pdMS_TO_TICKS(100));
+    esp_err_t ret = i2c_master_transmit(dev, buf, 2, 100);
+    i2c_master_bus_rm_device(dev);
+    return ret;
 }
 
 static esp_err_t i2c_read_bytes(uint8_t addr, uint8_t reg, uint8_t *dst,
                                 size_t len)
 {
-    return i2c_master_write_read_device(I2C_MASTER_PORT, addr, &reg, 1,
-                                        dst, len, pdMS_TO_TICKS(100));
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr,
+        .scl_speed_hz    = I2C_MASTER_FREQ,
+    };
+    i2c_master_dev_handle_t dev;
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev));
+    esp_err_t ret = i2c_master_transmit_receive(dev, &reg, 1, dst, len, 100);
+    i2c_master_bus_rm_device(dev);
+    return ret;
 }
 
 /* ---- TMP117 (I2C 0x48)  ------------------------------------------ */
@@ -537,13 +562,22 @@ static float tmp117_read(void)
 
 static void ntc_init(void)
 {
-    ESP_ERROR_CHECK(adc1_config_width(ADC_WIDTH_BIT_12));
-    ESP_ERROR_CHECK(adc1_config_channel_atten(NTC_ADC_CHANNEL, ADC_ATTEN_DB_11));
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &g_adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten    = ADC_ATTEN_DB_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(g_adc_handle, NTC_ADC_CHANNEL, &chan_cfg));
 }
 
 static float ntc_read(void)
 {
-    int raw = adc1_get_raw(NTC_ADC_CHANNEL);
+    int raw = 0;
+    if (adc_oneshot_read(g_adc_handle, NTC_ADC_CHANNEL, &raw) != ESP_OK) return NAN;
     if (raw <= 0 || raw >= (int)ADC_MAX_COUNTS) return NAN;
 
     float ratio = (float)raw / ADC_MAX_COUNTS;
@@ -558,14 +592,20 @@ static float ntc_read(void)
 
 static void ina219_init_one(uint8_t addr)
 {
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr,
+        .scl_speed_hz    = I2C_MASTER_FREQ,
+    };
+    i2c_master_dev_handle_t dev;
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev));
     /* Config reg:  16 V bus, ±3.2 A range, 12‑bit, 128‑sample avg */
     uint8_t cfg[] = {0x00, 0x39, 0x9F};
-    i2c_master_write_to_device(I2C_MASTER_PORT, addr, cfg, 3,
-                               pdMS_TO_TICKS(100));
+    i2c_master_transmit(dev, cfg, 3, 100);
     /* Cal reg:  0.1 Ω shunt, 3.2 A max  → LSB = 100 µA, Power_LSB = 2 mW */
     uint8_t cal[] = {0x05, 0x10, 0x00};
-    i2c_master_write_to_device(I2C_MASTER_PORT, addr, cal, 3,
-                               pdMS_TO_TICKS(100));
+    i2c_master_transmit(dev, cal, 3, 100);
+    i2c_master_bus_rm_device(dev);
 }
 
 static void ina219_init(void)
@@ -825,7 +865,9 @@ static void vMotorTask(void *pv)
         if (now - window_start_us >= 1000000LL) {
             float revs  = (float)step_count / (float)g_steps_per_rev;
             float rpm   = revs * 60.0f;
-            atomic_store(&g_effective_rpm, rpm);
+            taskENTER_CRITICAL(&g_rpm_mux);
+            g_effective_rpm = rpm;
+            taskEXIT_CRITICAL(&g_rpm_mux);
             step_count      = 0;
             window_start_us = now;
         }
@@ -874,7 +916,9 @@ static void vSensorTask(void *pv)
         }
 
         /* ---- RPM (atomic read — no mutex needed) ----------------- */
-        f.rpm = atomic_load(&g_effective_rpm);
+        taskENTER_CRITICAL(&g_rpm_mux);
+        f.rpm = g_effective_rpm;
+        taskEXIT_CRITICAL(&g_rpm_mux);
 
         /* ---- Guard against NaN ----------------------------------- */
         if (isnan(f.current))             f.current             = 0.0f;
@@ -951,7 +995,7 @@ static void vAzureTask(void *pv)
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri                     = broker_uri,
         .credentials.username                   = mqtt_user,
-        .credentials.authentication.client_id   = DEVICE_ID,
+        .credentials.client_id                  = DEVICE_ID,
         .session.keepalive                      = 30,
         .network.disable_auto_reconnect         = false,
     };
@@ -969,17 +1013,17 @@ static void vAzureTask(void *pv)
         /* ---- Set SAS token as MQTT password -------------------- */
         char sas[SAS_TOKEN_BUF_LEN];
         if (sas_token_copy(sas, sizeof(sas)) != NULL) {
-            esp_mqtt_client_set_config(g_mqtt_client,
+            esp_mqtt_set_config(g_mqtt_client,
                 &(esp_mqtt_client_config_t){
                     .broker.address.uri                     = broker_uri,
                     .credentials.username                   = mqtt_user,
                     .credentials.authentication.password    = sas,
-                    .credentials.authentication.client_id   = DEVICE_ID,
+                    .credentials.client_id                  = DEVICE_ID,
                 });
 
             if (!connected) {
                 esp_err_t e = esp_mqtt_client_start(g_mqtt_client);
-                connected = (e == ESP_OK || e == ESP_ERR_MQTT_ALREADY_CONNECTED);
+                connected = (e == ESP_OK);
                 if (!connected) ESP_LOGE(TAG, "MQTT start: %d", e);
             }
         }

@@ -50,3 +50,6 @@ results/
 
 # Environment / secrets — NEVER commit this
 .env
+
+#ESP IDF
+managed_components/
