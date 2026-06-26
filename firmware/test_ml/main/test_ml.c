@@ -23,9 +23,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "driver/gpio.h"
-#include "driver/adc.h"
+#include "esp_adc/adc_oneshot.h"
 
 #include "nilm_model.h"   /* only for NILM_MODEL_FEATURE_COUNT, nilm_model_feature_name() */
 
@@ -42,7 +42,7 @@
 #define INA219_B_ADDR       0x41
 
 /* NTC ADC */
-#define NTC_ADC_CHANNEL     ADC1_CHANNEL_6   /* GPIO34 */
+#define NTC_ADC_CHANNEL     ADC_CHANNEL_6   /* GPIO34 */
 #define NTC_NOMINAL_R       10000.0f
 #define NTC_NOMINAL_T_C     25.0f
 #define NTC_BETA            3950.0f
@@ -276,31 +276,49 @@ static float nilm_feature_value(const nilm_window_t *window, const char *name)
 /*  Sensor drivers  (identical to esp32_telemetry.c)                     */
 /* ==================================================================== */
 
+static i2c_master_bus_handle_t g_i2c_bus = NULL;
+
 static void i2c_init(void)
 {
-    i2c_config_t conf = {
-        .mode             = I2C_MODE_MASTER,
-        .sda_io_num       = I2C_MASTER_SDA,
-        .scl_io_num       = I2C_MASTER_SCL,
-        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ,
+    i2c_master_bus_config_t cfg = {
+        .clk_source        = I2C_CLK_SRC_DEFAULT,
+        .i2c_port          = I2C_MASTER_PORT,
+        .scl_io_num        = I2C_MASTER_SCL,
+        .sda_io_num        = I2C_MASTER_SDA,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    i2c_param_config(I2C_MASTER_PORT, &conf);
-    i2c_driver_install(I2C_MASTER_PORT, conf.mode, 0, 0, 0);
+    i2c_new_master_bus(&cfg, &g_i2c_bus);
 }
 
 static esp_err_t i2c_write_byte(uint8_t addr, uint8_t reg, uint8_t val)
 {
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr,
+        .scl_speed_hz    = I2C_MASTER_FREQ,
+    };
+    i2c_master_dev_handle_t dev;
+    i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev);
     uint8_t buf[2] = {reg, val};
-    return i2c_master_write_to_device(I2C_MASTER_PORT, addr, buf, 2, 10);
+    esp_err_t ret = i2c_master_transmit(dev, buf, 2, 10);
+    i2c_master_bus_rm_device(dev);
+    return ret;
 }
 
 static esp_err_t i2c_read_bytes(uint8_t addr, uint8_t reg, uint8_t *dst,
                                 size_t len)
 {
-    return i2c_master_write_read_device(I2C_MASTER_PORT, addr, &reg, 1,
-                                        dst, len, 10);
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr,
+        .scl_speed_hz    = I2C_MASTER_FREQ,
+    };
+    i2c_master_dev_handle_t dev;
+    i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev);
+    esp_err_t ret = i2c_master_transmit_receive(dev, &reg, 1, dst, len, 10);
+    i2c_master_bus_rm_device(dev);
+    return ret;
 }
 
 static float tmp117_read(void)
@@ -311,15 +329,26 @@ static float tmp117_read(void)
     return v * 0.0078125f;
 }
 
+static adc_oneshot_unit_handle_t g_adc_handle = NULL;
+
 static void ntc_init(void)
 {
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(NTC_ADC_CHANNEL, ADC_ATTEN_DB_11);
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    adc_oneshot_new_unit(&unit_cfg, &g_adc_handle);
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten    = ADC_ATTEN_DB_12,
+    };
+    adc_oneshot_config_channel(g_adc_handle, NTC_ADC_CHANNEL, &chan_cfg);
 }
 
 static float ntc_read(void)
 {
-    int raw = adc1_get_raw(NTC_ADC_CHANNEL);
+    int raw = 0;
+    if (adc_oneshot_read(g_adc_handle, NTC_ADC_CHANNEL, &raw) != ESP_OK) return NAN;
     if (raw <= 0 || raw >= (int)ADC_MAX_COUNTS) return NAN;
 
     float ratio = (float)raw / ADC_MAX_COUNTS;
@@ -332,11 +361,19 @@ static float ntc_read(void)
 
 static void ina219_init_one(uint8_t addr)
 {
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr,
+        .scl_speed_hz    = I2C_MASTER_FREQ,
+    };
+    i2c_master_dev_handle_t dev;
+    i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev);
     uint8_t cfg[] = {0x00, 0x39, 0x9F};
-    i2c_master_write_to_device(I2C_MASTER_PORT, addr, cfg, 3, 10);
+    i2c_master_transmit(dev, cfg, 3, 10);
     /* Cal: 0.1 Ω shunt, 100 µA/LSB → 2 mW/LSB power */
     uint8_t cal[] = {0x05, 0x10, 0x00};
-    i2c_master_write_to_device(I2C_MASTER_PORT, addr, cal, 3, 10);
+    i2c_master_transmit(dev, cal, 3, 10);
+    i2c_master_bus_rm_device(dev);
 }
 
 static void ina219_init(void)
