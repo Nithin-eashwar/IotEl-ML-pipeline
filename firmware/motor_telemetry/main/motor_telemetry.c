@@ -45,6 +45,8 @@
 #include "esp_sntp.h"
 #include "nvs_flash.h"
 
+#include "esp_task_wdt.h"
+
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
@@ -118,6 +120,12 @@
 #define SAS_TOKEN_TTL_SEC   3600
 #define SAS_REFRESH_SEC     3300            /* 55 min */
 #define SAS_TOKEN_BUF_LEN   512
+
+/* ---------- Reconnection & Watchdog --------------------------------- */
+
+#define MQTT_MAX_FAILS      5
+#define STUCK_LIMIT         10
+#define BACKOFF_MAX_MS      60000
 
 /* NILM model windowing must match ml/nilm_pipeline.py. */
 #define NILM_WINDOW_SIZE    128
@@ -210,6 +218,13 @@ static i2c_master_bus_handle_t g_i2c_bus = NULL;
 
 /* ---- ADC oneshot handle (IDF 6 new driver) */
 static adc_oneshot_unit_handle_t g_adc_handle = NULL;
+
+/* ---- Reconnection & Watchdog state */
+static uint32_t          s_wifi_retry    = 0;
+static uint32_t          s_mqtt_retry    = 0;
+static uint8_t           s_pub_fails     = 0;
+static volatile uint8_t  s_stuck_counter = 0;
+static volatile bool     g_connected     = false;
 
 /* ================================================================== */
 /*  ML INFERENCE HOOK                                                  */
@@ -997,7 +1012,7 @@ static void vAzureTask(void *pv)
         .credentials.username                   = mqtt_user,
         .credentials.client_id                  = DEVICE_ID,
         .session.keepalive                      = 30,
-        .network.disable_auto_reconnect         = false,
+        .network.disable_auto_reconnect         = true,
     };
 
     g_mqtt_client = esp_mqtt_client_init(&cfg);
@@ -1007,7 +1022,6 @@ static void vAzureTask(void *pv)
     ESP_LOGI(TAG, "Azure IoT Hub target:  %s", IOT_HUB_HOST);
 
     TickType_t last_pub = xTaskGetTickCount();
-    bool       connected = false;
 
     while (1) {
         /* ---- Set SAS token as MQTT password -------------------- */
@@ -1021,15 +1035,23 @@ static void vAzureTask(void *pv)
                     .credentials.client_id                  = DEVICE_ID,
                 });
 
-            if (!connected) {
+            if (!g_connected) {
+                uint32_t mqtt_delay = (1000u << s_mqtt_retry);
+                if (mqtt_delay > BACKOFF_MAX_MS) mqtt_delay = BACKOFF_MAX_MS;
+                if (s_mqtt_retry < 12) s_mqtt_retry++;
+                if (mqtt_delay > 0) vTaskDelay(pdMS_TO_TICKS(mqtt_delay));
                 esp_err_t e = esp_mqtt_client_start(g_mqtt_client);
-                connected = (e == ESP_OK);
-                if (!connected) ESP_LOGE(TAG, "MQTT start: %d", e);
+                g_connected = (e == ESP_OK);
+                if (g_connected) {
+                    s_mqtt_retry = 0;
+                } else {
+                    ESP_LOGE(TAG, "MQTT start: %d", e);
+                }
             }
         }
 
         /* ---- Publish every 5 s --------------------------------- */
-        if (connected
+        if (g_connected
             && xTaskGetTickCount() - last_pub >= pdMS_TO_TICKS(AZURE_PUBLISH_MS)) {
 
             telemetry_packet_t pkt;
@@ -1066,10 +1088,16 @@ static void vAzureTask(void *pv)
                     int mid = esp_mqtt_client_publish(g_mqtt_client, pub_topic,
                                                       payload, 0, 1, 0);
                     if (mid < 0) {
-                        ESP_LOGE(TAG, "Publish failed — reconnecting");
+                        s_pub_fails++;
+                        ESP_LOGE(TAG, "Publish failed (%d/%d) — reconnecting",
+                                 s_pub_fails, MQTT_MAX_FAILS);
+                        if (s_pub_fails >= MQTT_MAX_FAILS) {
+                            s_stuck_counter = STUCK_LIMIT;
+                        }
                         esp_mqtt_client_stop(g_mqtt_client);
-                        connected = false;
+                        g_connected = false;
                     } else {
+                        s_pub_fails = 0;
                         ESP_LOGI(TAG, "→ Azure  |  status=%-8s  ntc=%.1f °C  "
                                  "amb=%.1f °C  vib=%.2f g   cur=%.2f A   "
                                  "ia=%.2f A   ib=%.2f A   rpm=%.0f",
@@ -1089,6 +1117,31 @@ static void vAzureTask(void *pv)
 }
 
 /* ================================================================== */
+/*  WATCHDOG                                                           */
+/* ================================================================== */
+
+static void vWatchdogTask(void *pv)
+{
+    esp_task_wdt_add(NULL);
+
+    while (1) {
+        if (g_sas_valid && g_connected) {
+            s_stuck_counter = 0;
+            esp_task_wdt_reset();
+        } else {
+            s_stuck_counter++;
+            ESP_LOGW(TAG, "Watchdog: stuck_counter=%d  sas=%d  connected=%d",
+                     s_stuck_counter, g_sas_valid, g_connected);
+        }
+        if (s_stuck_counter >= STUCK_LIMIT) {
+            ESP_LOGE(TAG, "Watchdog: system stuck — restarting");
+            esp_restart();
+        }
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+}
+
+/* ================================================================== */
 /*  WIFI                                                               */
 /* ================================================================== */
 
@@ -1098,10 +1151,26 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     if (id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi‑Fi disconnected — reconnecting …");
+        wifi_event_sta_disconnected_t *ev = (wifi_event_sta_disconnected_t *)data;
+        switch (ev->reason) {
+        case WIFI_REASON_AUTH_FAIL:
+        case WIFI_REASON_NO_AP_FOUND:
+        case WIFI_REASON_ASSOC_LEAVE:
+            ESP_LOGE(TAG, "Wi‑Fi disconnected — permanent failure (reason %d)", ev->reason);
+            return;
+        default:
+            break;
+        }
+        uint32_t delay = (1000u << s_wifi_retry);
+        if (delay > BACKOFF_MAX_MS) delay = BACKOFF_MAX_MS;
+        if (s_wifi_retry < 12) s_wifi_retry++;
+        ESP_LOGW(TAG, "Wi‑Fi disconnected (reason %d) — reconnecting in %lu ms",
+                 ev->reason, (unsigned long)delay);
+        vTaskDelay(pdMS_TO_TICKS(delay));
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        s_wifi_retry = 0;
         ESP_LOGI(TAG, "Wi‑Fi connected — IP: " IPSTR, IP2STR(&ev->ip_info.ip));
     }
 }
@@ -1159,7 +1228,16 @@ void app_main(void)
     g_sensor_mutex    = xSemaphoreCreateMutex();
     g_telemetry_queue = xQueueCreate(1, sizeof(telemetry_packet_t));
 
+    /* ---- Task watchdog (60 s timeout, trigger panic on expiry) -- */
+    esp_task_wdt_config_t twdt_config = {
+        .timeout_ms      = 60000,
+        .idle_core_mask  = 0,
+        .trigger_panic   = true,
+    };
+    ESP_ERROR_CHECK(esp_task_wdt_init(&twdt_config));
+
     /* ---- Tasks ---------------------------------------------------
+     * watchdog    prio 1  —  health check, feeds TWDT, triggers restart
      * sas_refresh  prio 0  —  low‑priority background token refresh
      * motor        prio 2  —  RMT stepper (RMT ISR has higher hw prio)
      * sensors      prio 3  —  I2C + ML inference
@@ -1169,6 +1247,7 @@ void app_main(void)
      * moderate TFLite Micro models;  increase to 32 KB if your model
      * uses a large tensor arena (allocate arena statically, not on stack).
      * ------------------------------------------------------------- */
+    xTaskCreate(vWatchdogTask,   "watchdog",   2048,  NULL, 1, NULL);
     xTaskCreate(sas_refresh_task, "sas_refresh", 4096,  NULL, 0, NULL);
     xTaskCreate(vMotorTask,       "motor",       2048,  NULL, 2, NULL);
     xTaskCreate(vSensorTask,      "sensors",     16384, NULL, 3, NULL);
