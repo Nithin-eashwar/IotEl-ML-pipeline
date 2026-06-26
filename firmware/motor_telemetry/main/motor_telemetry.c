@@ -54,6 +54,8 @@
 
 #include "mqtt_client.h"
 
+#include "esp_crt_bundle.h"
+
 #include "mbedtls/base64.h"
 #include "psa/crypto.h"
 
@@ -1009,6 +1011,7 @@ static void vAzureTask(void *pv)
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri                     = broker_uri,
+        .broker.verification.crt_bundle_attach  = esp_crt_bundle_attach,
         .credentials.username                   = mqtt_user,
         .credentials.client_id                  = DEVICE_ID,
         .session.keepalive                      = 30,
@@ -1030,6 +1033,7 @@ static void vAzureTask(void *pv)
             esp_mqtt_set_config(g_mqtt_client,
                 &(esp_mqtt_client_config_t){
                     .broker.address.uri                     = broker_uri,
+                    .broker.verification.crt_bundle_attach  = esp_crt_bundle_attach,
                     .credentials.username                   = mqtt_user,
                     .credentials.authentication.password    = sas,
                     .credentials.client_id                  = DEVICE_ID,
