@@ -60,3 +60,6 @@ managed_components/
 # Local configuration files
 sdkconfig
 sdkconfig.old
+
+#ESP-IDF Custom Partition
+!firmware/motor_telemetry/partitions.csv

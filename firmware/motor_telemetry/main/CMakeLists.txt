@@ -17,5 +17,4 @@ idf_component_register(
         esp_timer
         freertos
         esp_netif
-        esp_task_wdt
 )
