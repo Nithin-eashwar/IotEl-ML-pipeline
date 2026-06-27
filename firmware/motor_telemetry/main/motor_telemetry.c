@@ -215,6 +215,12 @@ static esp_mqtt_client_handle_t g_mqtt_client = NULL;
 /* ---- Telemetry queue */
 static QueueHandle_t g_telemetry_queue = NULL;
 
+/* ---- NTP sync flag */
+static volatile bool g_ntp_synced = false;
+
+/* ---- Epoch minimum for SAS generation */
+#define MIN_VALID_EPOCH 1704067200ULL  /* Jan 1 2024 */
+
 /* ---- I2C master bus handle (IDF 6 new driver) */
 static i2c_master_bus_handle_t g_i2c_bus = NULL;
 
@@ -703,6 +709,12 @@ static void url_encode_sas(const char *src, char *dst, size_t dst_len)
 
 static bool generate_sas_token(char *token_buf, size_t buf_len)
 {
+    /* Epoch guard — refuse to generate before NTP syncs */
+    if ((uint64_t)time(NULL) < MIN_VALID_EPOCH) {
+        ESP_LOGE(TAG, "Clock not synced — refusing SAS generation");
+        return false;
+    }
+
     /* 1.  Base64‑decode the primary key  --------------------------- */
     size_t kr = 0;
     mbedtls_base64_decode(NULL, 0, &kr,
@@ -714,14 +726,17 @@ static bool generate_sas_token(char *token_buf, size_t buf_len)
         (const unsigned char *)PRIMARY_KEY, strlen(PRIMARY_KEY)) != 0)
         return false;
 
-    /* 2.  String‑to‑sign  =  URL(host) + "\n" + expiry  ----------- */
+    /* 2.  String‑to‑sign  =  URL(host/devices/deviceid) + "\n" + expiry  -- */
     time_t expiry = time(NULL) + SAS_TOKEN_TTL_SEC;
-    char   url_host[128];
-    url_encode_sas(IOT_HUB_HOST, url_host, sizeof(url_host));
+    char   resource_uri[256];
+    snprintf(resource_uri, sizeof(resource_uri), "%s/devices/%s",
+             IOT_HUB_HOST, DEVICE_ID);
+    char url_resource[256];
+    url_encode_sas(resource_uri, url_resource, sizeof(url_resource));
 
-    char sts[256];
+    char sts[512];
     int  sts_len = snprintf(sts, sizeof(sts), "%s\n%" PRIu64,
-                            url_host, (uint64_t)expiry);
+                            url_resource, (uint64_t)expiry);
 
     /* 3.  HMAC‑SHA256  --------------------------------------------- */
     uint8_t hmac[32];
@@ -740,8 +755,8 @@ static bool generate_sas_token(char *token_buf, size_t buf_len)
 
     /* 5.  Assemble full SAS token  --------------------------------- */
     snprintf(token_buf, buf_len,
-        "SharedAccessSignature sr=%s%%2Fdevices%%2F%s&sig=%s&se=%" PRIu64,
-        url_host, DEVICE_ID, sig_enc, (uint64_t)expiry);
+        "SharedAccessSignature sig=%s&se=%" PRIu64 "&sr=%s",
+        sig_enc, (uint64_t)expiry, url_resource);
 
     return true;
 }
@@ -1044,6 +1059,23 @@ static void vAzureTask(void *pv)
                 if (mqtt_delay > BACKOFF_MAX_MS) mqtt_delay = BACKOFF_MAX_MS;
                 if (s_mqtt_retry < 12) s_mqtt_retry++;
                 if (mqtt_delay > 0) vTaskDelay(pdMS_TO_TICKS(mqtt_delay));
+                /* Destroy old handle before re-creating */
+                if (g_mqtt_client != NULL) {
+                    esp_mqtt_client_stop(g_mqtt_client);
+                    esp_mqtt_client_destroy(g_mqtt_client);
+                    g_mqtt_client = NULL;
+                }
+                esp_mqtt_client_config_t *re_cfg = &(esp_mqtt_client_config_t){
+                    .broker.address.uri                     = broker_uri,
+                    .broker.verification.crt_bundle_attach  = esp_crt_bundle_attach,
+                    .credentials.username                   = mqtt_user,
+                    .credentials.client_id                  = DEVICE_ID,
+                    .session.keepalive                      = 30,
+                    .network.disable_auto_reconnect         = true,
+                };
+                g_mqtt_client = esp_mqtt_client_init(re_cfg);
+                esp_mqtt_client_register_event(g_mqtt_client, ESP_EVENT_ANY_ID,
+                                               mqtt_event_handler, NULL);
                 esp_err_t e = esp_mqtt_client_start(g_mqtt_client);
                 g_connected = (e == ESP_OK);
                 if (g_connected) {
@@ -1201,6 +1233,14 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+/* ---- NTP sync callback  ----------------------------------------- */
+
+static void sntp_sync_cb(struct timeval *tv)
+{
+    g_ntp_synced = true;
+    ESP_LOGI(TAG, "NTP synced via callback — epoch %" PRIu64, (uint64_t)tv->tv_sec);
+}
+
 /* ================================================================== */
 /*  MAIN                                                               */
 /* ================================================================== */
@@ -1215,12 +1255,13 @@ void app_main(void)
     i2c_init();
 
     /* ---- NTP time sync (required for SAS & payload timestamps) -- */
+    vTaskDelay(pdMS_TO_TICKS(2000));  /* settle delay for network */
+    esp_sntp_set_time_sync_notification_cb(sntp_sync_cb);
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(0, "time.google.com");
+    esp_sntp_setservername(1, "pool.ntp.org");
     esp_sntp_init();
-    for (int retry = 0;
-         sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && retry < 30;
-         retry++)
+    for (int retry = 0; !g_ntp_synced && retry < 60; retry++)
         vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_LOGI(TAG, "NTP %s (epoch %" PRIu64 ")",
              sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED
@@ -1238,7 +1279,7 @@ void app_main(void)
         .idle_core_mask  = 0,
         .trigger_panic   = true,
     };
-    ESP_ERROR_CHECK(esp_task_wdt_init(&twdt_config));
+    ESP_ERROR_CHECK(esp_task_wdt_reconfigure(&twdt_config));
 
     /* ---- Tasks ---------------------------------------------------
      * watchdog    prio 1  —  health check, feeds TWDT, triggers restart
