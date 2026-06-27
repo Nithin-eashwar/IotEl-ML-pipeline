@@ -71,15 +71,8 @@
 #endif
 
 /* ================================================================== */
-/*  CONFIG  —  change these for your deployment                        */
+/*  CONFIG  —  injected via CMake from host environment              */
 /* ================================================================== */
-
-#define WIFI_SSID           "YOUR_WIFI_SSID"
-#define WIFI_PASS           "YOUR_WIFI_PASSWORD"
-
-#define IOT_HUB_HOST        "your-hub.azure-devices.net"
-#define DEVICE_ID           "nema17-bay3-abc123"
-#define PRIMARY_KEY         "your-base64-primary-key=="
 
 /* ---------- Motor -------------------------------------------------- */
 
