@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS
+        "telemetry_test.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        freertos
+        esp_wifi
+        esp_event
+        esp_netif
+        nvs_flash
+        esp_timer
+        mqtt
+        esp-tls
+        mbedtls
+        lwip
+        app_update
+)

@@ -14,6 +14,7 @@ Run: python nilm_pipeline.py
 
 import argparse
 import os
+import textwrap
 import warnings
 
 # Avoid unreliable physical-core detection in some restricted Windows shells.
@@ -517,6 +518,200 @@ def choose_best_result(results):
             -len(result["features"]),
         ),
     )
+
+
+def choose_best_random_forest_result(results):
+    rf_results = [
+        result for result in results if result["model_name"] == "Random Forest"
+    ]
+    if not rf_results:
+        raise ValueError("No Random Forest result is available for firmware export.")
+    return choose_best_result(rf_results)
+
+
+def _c_string(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _format_float(value):
+    if not np.isfinite(value):
+        return "0.0f"
+    s = f"{float(value):.9g}"
+    if "." not in s:
+        s += ".0"
+    return s + "f"
+
+
+def export_random_forest_firmware(model, feature_cols, class_names, output_dir):
+    """
+    Export a fitted sklearn RandomForestClassifier as plain C arrays.
+
+    The firmware walks each tree until a leaf, sums per-tree class
+    probabilities, then returns the class with the largest average vote.
+    """
+    clf = model.named_steps.get("clf")
+    if not isinstance(clf, RandomForestClassifier):
+        raise TypeError("Firmware export requires a fitted RandomForestClassifier.")
+
+    os.makedirs(output_dir, exist_ok=True)
+    header_path = os.path.join(output_dir, "nilm_model.h")
+    source_path = os.path.join(output_dir, "nilm_model.c")
+    classes = [int(value) for value in clf.classes_]
+    class_count = len(classes)
+
+    header = f"""\
+    #pragma once
+
+    #include <stddef.h>
+
+    #ifdef __cplusplus
+    extern "C" {{
+    #endif
+
+    #define NILM_MODEL_FEATURE_COUNT {len(feature_cols)}
+    #define NILM_MODEL_CLASS_COUNT {class_count}
+
+    size_t nilm_model_feature_count(void);
+    const char *nilm_model_feature_name(size_t index);
+    int nilm_model_predict(const float features[NILM_MODEL_FEATURE_COUNT],
+                           float *confidence);
+    const char *nilm_model_class_name(int class_id);
+
+    #ifdef __cplusplus
+    }}
+    #endif
+    """
+
+    source_lines = [
+        '#include "nilm_model.h"',
+        "",
+        "typedef struct {",
+        "    int feature;",
+        "    float threshold;",
+        "    int left;",
+        "    int right;",
+        f"    float proba[{class_count}];",
+        "} NilmTreeNode;",
+        "",
+        "typedef struct {",
+        "    const NilmTreeNode *nodes;",
+        "    int node_count;",
+        "} NilmTree;",
+        "",
+        "static const char *const FEATURE_NAMES[NILM_MODEL_FEATURE_COUNT] = {",
+    ]
+    source_lines.extend(f"    {_c_string(name)}," for name in feature_cols)
+    source_lines.extend(
+        [
+            "};",
+            "",
+            f"static const int CLASS_IDS[NILM_MODEL_CLASS_COUNT] = "
+            f"{{{', '.join(map(str, classes))}}};",
+            "",
+            "static const char *const CLASS_NAMES[NILM_MODEL_CLASS_COUNT] = {",
+        ]
+    )
+    source_lines.extend(
+        f"    {_c_string(class_names.get(class_id, str(class_id)))},"
+        for class_id in classes
+    )
+    source_lines.append("};")
+
+    for tree_index, estimator in enumerate(clf.estimators_):
+        tree = estimator.tree_
+        source_lines.extend(
+            [
+                "",
+                f"static const NilmTreeNode TREE_{tree_index}_NODES[] = {{",
+            ]
+        )
+        for node_index in range(tree.node_count):
+            feature = int(tree.feature[node_index])
+            threshold = _format_float(tree.threshold[node_index])
+            left = int(tree.children_left[node_index])
+            right = int(tree.children_right[node_index])
+            values = tree.value[node_index][0]
+            total = float(np.sum(values))
+            if total > 0.0:
+                probabilities = [value / total for value in values]
+            else:
+                probabilities = [0.0] * class_count
+            proba = ", ".join(_format_float(value) for value in probabilities)
+            source_lines.append(
+                f"    {{{feature}, {threshold}, {left}, {right}, {{{proba}}}}},"
+            )
+        source_lines.append("};")
+
+    source_lines.extend(["", "static const NilmTree TREES[] = {"])
+    for tree_index, estimator in enumerate(clf.estimators_):
+        source_lines.append(
+            f"    {{TREE_{tree_index}_NODES, {estimator.tree_.node_count}}},"
+        )
+    source_lines.extend(
+        [
+            "};",
+            "",
+            "size_t nilm_model_feature_count(void)",
+            "{",
+            "    return NILM_MODEL_FEATURE_COUNT;",
+            "}",
+            "",
+            "const char *nilm_model_feature_name(size_t index)",
+            "{",
+            "    return index < NILM_MODEL_FEATURE_COUNT ? FEATURE_NAMES[index] : \"\";",
+            "}",
+            "",
+            "const char *nilm_model_class_name(int class_id)",
+            "{",
+            "    for (size_t i = 0; i < NILM_MODEL_CLASS_COUNT; ++i) {",
+            "        if (CLASS_IDS[i] == class_id) return CLASS_NAMES[i];",
+            "    }",
+            "    return \"unknown\";",
+            "}",
+            "",
+            "int nilm_model_predict(const float features[NILM_MODEL_FEATURE_COUNT],",
+            "                       float *confidence)",
+            "{",
+            "    float votes[NILM_MODEL_CLASS_COUNT] = {0};",
+            "    const int tree_count = (int)(sizeof(TREES) / sizeof(TREES[0]));",
+            "",
+            "    for (int tree_index = 0; tree_index < tree_count; ++tree_index) {",
+            "        const NilmTree *tree = &TREES[tree_index];",
+            "        int node_index = 0;",
+            "",
+            "        while (node_index >= 0 && node_index < tree->node_count) {",
+            "            const NilmTreeNode *node = &tree->nodes[node_index];",
+            "            if (node->feature < 0) {",
+            "                for (size_t c = 0; c < NILM_MODEL_CLASS_COUNT; ++c) {",
+            "                    votes[c] += node->proba[c];",
+            "                }",
+            "                break;",
+            "            }",
+            "            node_index = features[node->feature] <= node->threshold",
+            "                ? node->left",
+            "                : node->right;",
+            "        }",
+            "    }",
+            "",
+            "    size_t best = 0;",
+            "    for (size_t c = 1; c < NILM_MODEL_CLASS_COUNT; ++c) {",
+            "        if (votes[c] > votes[best]) best = c;",
+            "    }",
+            "    if (confidence != NULL) {",
+            "        *confidence = tree_count > 0 ? votes[best] / (float)tree_count : 0.0f;",
+            "    }",
+            "    return CLASS_IDS[best];",
+            "}",
+            "",
+        ]
+    )
+
+    with open(header_path, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(header))
+    with open(source_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(source_lines))
+
+    return header_path, source_path
 
 
 def evaluate_test_ablations(results, X_dev, y_dev, X_test, y_test, section_label):
@@ -1101,11 +1296,29 @@ def main(mode="cross_session"):
     print(f"      Variant : {best['variant']}  ({len(best['features'])} features)")
     print(f"      Model   : {best['model_name']}")
 
+    embedded_best = choose_best_random_forest_result(results)
+    embedded_model = clone(embedded_best["model"])
+    embedded_model.fit(X_dev[embedded_best["features"]], y_dev)
+    firmware_dir = os.path.abspath(os.path.join(BASE_DIR, "..", "firmware"))
+    header_path, source_path = export_random_forest_firmware(
+        embedded_model,
+        embedded_best["features"],
+        CLASS_NAMES,
+        firmware_dir,
+    )
+    print("\n  [✓] ESP32 Random Forest export")
+    print(f"      Header  : {header_path}")
+    print(f"      Source  : {source_path}")
+    print(
+        f"      Variant : {embedded_best['variant']}  "
+        f"({len(embedded_best['features'])} features)"
+    )
+
     if mode == "cross_session":
         # ── Cross-session evaluation (Original ~77% run) ───────────────────────
         cross_data = load_cross_session_data()
         evaluate_cross_session(best, X_dev, y_dev, cross_data, OUTPUT_DIR)
-        
+
         print("\n" + "=" * 72)
         print("  Pipeline complete.")
         print(
@@ -1117,7 +1330,7 @@ def main(mode="cross_session"):
     else:
         # ── LOSO cross-session evaluation (Rigorous ~65% run) ──────────────────
         run_loso(OUTPUT_DIR)
-        
+
         print("\n" + "=" * 72)
         print("  Pipeline complete.")
         print(
