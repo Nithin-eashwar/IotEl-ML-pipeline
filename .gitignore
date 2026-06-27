@@ -39,6 +39,9 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
+.codex
+.agents
+.commandcode
 
 # Generated Results
 results/
@@ -47,3 +50,16 @@ results/
 
 # Environment / secrets — NEVER commit this
 .env
+
+# ESP-IDF build output directory
+build/
+
+# Managed components downloaded by the ESP Component Manager
+managed_components/
+
+# Local configuration files
+sdkconfig
+sdkconfig.old
+
+#ESP-IDF Custom Partition
+!firmware/motor_telemetry/partitions.csv
