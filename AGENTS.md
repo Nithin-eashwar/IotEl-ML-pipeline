@@ -351,3 +351,132 @@ static void vWatchdogTask(void *pv)
 | `s_pub_fails` | `uint8_t` | Consecutive publish failures, reset on success |
 | `s_stuck_counter` | `volatile uint8_t` | Watchdog stuck count, incremented when unhealthy |
 | `g_connected` | `volatile bool` | File-scope MQTT connected flag, read by watchdog |
+
+---
+
+## Azure IoT Hub Connectivity: Issues Fixed & Lessons
+
+These are the bug fixes that got the firmware from TLS connection failures to successful Azure telemetry.
+
+### 1. TLS verification — use certificate bundle, not skip_cert_common_name_check
+
+**Symptom:** `ESP_ERR_MBEDTLS_SSL_SETUP_FAILED`, "No server verification option set"
+
+**Wrong fix (do not use):** `.broker.verification.skip_cert_common_name_check = true` — this bypasses certificate verification entirely, making the connection MITM-able. It also only works because ESP-MQTT's wrapper treats "any field set under verification" as authmode=optional without a CA cert.
+
+**Correct fix:**
+```c
+#include "esp_crt_bundle.h"
+// in both esp_mqtt_client_config_t and esp_mqtt_set_config():
+.broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+```
+
+**Prerequisites (already set in sdkconfig):**
+```
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+```
+
+The full default bundle includes DigiCert Global Root G2 — Azure IoT Hub's CA. No PEM files needed. No sdkconfig changes needed.
+
+**Why skip_cert_common_name_check appeared to work:** It's not a verification method — it only relaxes CN matching when a cert IS being validated. ESP-TLS v6 sees any field set in `verification` and selects `MBEDTLS_SSL_VERIFY_OPTIONAL` with no CA cert, which means "encrypt but don't verify." This is dangerous. `crt_bundle_attach` is the proper verification method.
+
+### 2. SAS token — sign the full resource URI, correct field order
+
+**Symptom:** Azure returns 401 Unauthorized despite correct device key
+
+**Wrong:** Signing only the hostname (`motor-predictor-hub.azure-devices.net`) and using `sr=` first in the token.
+
+**Correct:**
+```c
+// String-to-sign = URL_ENCODED(host/devices/deviceid) + "\n" + expiry
+char resource_uri[256];
+snprintf(resource_uri, sizeof(resource_uri), "%s/devices/%s",
+         IOT_HUB_HOST, DEVICE_ID);
+
+// Token = SharedAccessSignature sig=SIG&se=EXPIRY&sr=RESOURCE
+snprintf(token_buf, buf_len,
+    "SharedAccessSignature sig=%s&se=%" PRIu64 "&sr=%s",
+    sig_enc, (uint64_t)expiry, url_resource);
+```
+
+Azure IoT Hub requires the HMAC to be computed over `{url-encoded-resource}\n{expiry}` where resource = `{hub}/devices/{device}`. The token field order must be `sig=`, `se=`, `sr=`.
+
+### 3. MQTT client handle — destroy and recreate on reconnect
+
+**Symptom:** `ESP_ERR_INVALID_STATE` when calling `esp_mqtt_client_start()` on a previously failed handle
+
+**Fix:** Before retrying start after a failure:
+```c
+if (g_mqtt_client != NULL) {
+    esp_mqtt_client_stop(g_mqtt_client);
+    esp_mqtt_client_destroy(g_mqtt_client);
+    g_mqtt_client = NULL;
+}
+g_mqtt_client = esp_mqtt_client_init(&cfg);   // fresh handle
+esp_mqtt_client_register_event(...);           // re-register event handler
+esp_mqtt_client_start(g_mqtt_client);          // now it works
+```
+
+ESP-MQTT v6 uses internal state machines — reuse after a tear-down is not guaranteed.
+
+### 4. NTP — use callback, not polling sntp_get_sync_status()
+
+**Symptom:** `sntp_get_sync_status()` returned `SNTP_SYNC_STATUS_RESET` indefinitely
+
+**Fix:** Register a time-sync notification callback instead of busy-polling:
+```c
+static volatile bool g_ntp_synced = false;
+
+static void sntp_sync_cb(struct timeval *tv) {
+    g_ntp_synced = true;
+}
+
+// In app_main:
+vTaskDelay(pdMS_TO_TICKS(2000));   // settle delay
+esp_sntp_set_time_sync_notification_cb(sntp_sync_cb);
+// Use two servers for reliability
+esp_sntp_setservername(0, "time.google.com");
+esp_sntp_setservername(1, "pool.ntp.org");
+esp_sntp_init();
+for (int retry = 0; !g_ntp_synced && retry < 60; retry++)
+    vTaskDelay(pdMS_TO_TICKS(1000));
+```
+
+### 5. Epoch guard — prevent SAS generation before NTP sync
+
+**Symptom:** SAS tokens generated with epoch 0 or bogus time are rejected by Azure (but the real diagnostic signal is the NTP callback fix above)
+
+**Fix:** Guard `generate_sas_token()`:
+```c
+#define MIN_VALID_EPOCH 1704067200ULL  /* Jan 1 2024 */
+if ((uint64_t)time(NULL) < MIN_VALID_EPOCH) {
+    return false;  // clock not synced
+}
+```
+
+### 6. Component dependencies — espressif__mqtt, esp_task_wdt, and idf_component.yml
+
+**Lessons:**
+- `espressif__mqtt` must be declared in `main/CMakeLists.txt` REQUIRES AND fetchable via `idf_component.yml` (add `espressif/mqtt: "^1.1.0"` under dependencies)
+- `esp_task_wdt` is NOT a standalone component in IDF v6 — it's built into `freertos`. Remove it from REQUIRES.
+- `esp_task_wdt_init()` does NOT exist in IDF v6 — use `esp_task_wdt_reconfigure()` instead
+
+### 7. Build-time secrets — inject via CMake, never hardcode
+
+**Principle:** Credentials (WiFi SSID/pass, IoT Hub host, device ID, primary key) must never be committed. Use CMake `add_definitions(-DVAR="$ENV{VAR}")` to inject them from host environment at build time.
+
+**Setup:**
+1. `.env` file in project root (gitignored): `export WIFI_SSID="..."` etc.
+2. `main/CMakeLists.txt` reads `$ENV{...}` → `add_definitions(-DMACRO="value")`
+3. `build.sh` wrapper: `source .env && docker run ... -e VAR ... idf.py "$@"`
+
+### Future Coding Guidelines for This Project
+
+1. **Never** commit credentials — always use CMake env injection + `.env` + `.gitignore`
+2. **Never** use `skip_cert_common_name_check` — use the x509 cert bundle (`esp_crt_bundle_attach`)
+3. **Always** destroy and recreate MQTT client handles on reconnect — don't reuse after failure
+4. **Always** use SNTP callback for time sync — polling `sntp_get_sync_status()` is unreliable
+5. **Always** guard SAS generation with a minimum epoch check
+6. **Check** `idf_component.yml` when adding a managed component — REQUIRES alone isn't enough
+7. **Check** component names against IDF v6 API — `esp_task_wdt` doesn't exist as a standalone component, `ADC_ATTEN_DB_11` was renamed to `DB_12`, `ADC1_CHANNEL_6` → `ADC_CHANNEL_6`
