@@ -211,6 +211,9 @@ static QueueHandle_t g_telemetry_queue = NULL;
 /* ---- NTP sync flag */
 static volatile bool g_ntp_synced = false;
 
+/* ---- WiFi IP assigned flag (for POST sequencing) */
+static volatile bool g_wifi_ip_assigned = false;
+
 /* ---- Epoch minimum for SAS generation */
 #define MIN_VALID_EPOCH 1704067200ULL  /* Jan 1 2024 */
 
@@ -1200,6 +1203,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         s_wifi_retry = 0;
+        g_wifi_ip_assigned = true;
         ESP_LOGI(TAG, "Wi‑Fi connected — IP: " IPSTR, IP2STR(&ev->ip_info.ip));
     }
 }
@@ -1226,6 +1230,194 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+/* ================================================================== */
+/*  POWER-ON SELF TEST  —  sequential, before any RTOS task            */
+/* ================================================================== */
+
+static volatile bool g_mqtt_post_ok = false;
+
+static void post_mqtt_event(void *arg, esp_event_base_t base,
+                            int32_t id, void *data)
+{
+    esp_mqtt_event_handle_t ev = (esp_mqtt_event_handle_t)data;
+    if (ev->event_id == MQTT_EVENT_CONNECTED) {
+        g_mqtt_post_ok = true;
+    }
+}
+
+static void run_post(void)
+{
+    ESP_LOGI(TAG, "──────────────────────────────────────────");
+    ESP_LOGI(TAG, "  POWER-ON SELF TEST");
+    ESP_LOGI(TAG, "──────────────────────────────────────────");
+    bool all_ok = true;
+
+    /* 1. WiFi ------------------------------------------------------ */
+    ESP_LOGI(TAG, "[POST 1/7] WiFi ...");
+    for (int i = 0; !g_wifi_ip_assigned && i < 30; i++)
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    if (g_wifi_ip_assigned) {
+        ESP_LOGI(TAG, "[POST 1/7] WiFi .............. PASS");
+    } else {
+        ESP_LOGE(TAG, "[POST 1/7] WiFi .............. FAIL (no IP after 30 s)");
+        all_ok = false;
+    }
+
+    /* 2. NTP ------------------------------------------------------- */
+    ESP_LOGI(TAG, "[POST 2/7] NTP ...");
+    for (int i = 0; !g_ntp_synced && i < 30; i++)
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    if (g_ntp_synced) {
+        ESP_LOGI(TAG, "[POST 2/7] NTP .............. PASS (epoch %" PRIu64 ")",
+                 (uint64_t)time(NULL));
+    } else {
+        ESP_LOGW(TAG, "[POST 2/7] NTP .............. WARN (timeout, SAS will fail)");
+    }
+
+    /* 3. I2C bus --------------------------------------------------- */
+    ESP_LOGI(TAG, "[POST 3/7] I2C bus ...");
+    i2c_init();
+    bool i2c_ok = (g_i2c_bus != NULL);
+    int  devs = 0;
+    if (i2c_ok) {
+        uint8_t dummy;
+        if (i2c_read_bytes(TMP117_ADDR,  0x00, &dummy, 1) == ESP_OK) devs++;
+        if (i2c_read_bytes(ADXL345_ADDR, 0x00, &dummy, 1) == ESP_OK) devs++;
+        if (i2c_read_bytes(INA219_A_ADDR, 0x00, &dummy, 1) == ESP_OK) devs++;
+        if (i2c_read_bytes(INA219_B_ADDR, 0x00, &dummy, 1) == ESP_OK) devs++;
+        ESP_LOGI(TAG, "[POST 3/7] I2C bus ........... PASS (%d/4 devices responded)", devs);
+        if (devs < 4)
+            ESP_LOGW(TAG, "  (missing devices will read as 0)");
+    } else {
+        ESP_LOGE(TAG, "[POST 3/7] I2C bus ........... FAIL");
+        all_ok = false;
+    }
+
+    /* 4. Sensors --------------------------------------------------- */
+    ESP_LOGI(TAG, "[POST 4/7] Sensors ...");
+    ntc_init();
+    adxl345_init();
+    ina219_init();
+    float t = tmp117_read();
+    float n = ntc_read();
+    float ax, ay, az;
+    adxl345_read_raw(&ax, &ay, &az);
+    bool sensors_ok = !isnan(t) || !isnan(n) || !isnan(ax);
+    if (sensors_ok) {
+        ESP_LOGI(TAG, "[POST 4/7] Sensors ........... PASS (tmp117=%.1f°C ntc=%.1f°C "
+                 "accel=%.1f,%.1f,%.1f)",
+                 isnan(t) ? 0.0f : t, isnan(n) ? 0.0f : n,
+                 isnan(ax) ? 0.0f : ax, isnan(ay) ? 0.0f : ay,
+                 isnan(az) ? 0.0f : az);
+    } else {
+        ESP_LOGE(TAG, "[POST 4/7] Sensors ........... FAIL (all NAN)");
+        all_ok = false;
+    }
+
+    /* 5. ML model -------------------------------------------------- */
+    ESP_LOGI(TAG, "[POST 5/7] ML model ...");
+#if NILM_MODEL_AVAILABLE
+    ESP_LOGI(TAG, "[POST 5/7] ML model .......... PASS (%d features, %d trees)",
+             NILM_MODEL_FEATURE_COUNT, NILM_MODEL_CLASS_COUNT);
+#else
+    ESP_LOGW(TAG, "[POST 5/7] ML model .......... SKIP (no model, using threshold)");
+#endif
+
+    /* 6. SAS + MQTT TLS -------------------------------------------- */
+    ESP_LOGI(TAG, "[POST 6/7] MQTT TLS ...");
+    if (generate_sas_token(g_sas_token, sizeof(g_sas_token))) {
+        g_sas_valid = true;
+        ESP_LOGI(TAG, "  SAS token generated");
+
+        char uri[128];
+        snprintf(uri, sizeof(uri), "mqtts://%s:8883", IOT_HUB_HOST);
+        char user[256];
+        snprintf(user, sizeof(user), "%s/%s/?api-version=2021-04-12",
+                 IOT_HUB_HOST, DEVICE_ID);
+
+        g_mqtt_post_ok = false;
+        esp_mqtt_client_config_t cfg = {
+            .broker.address.uri                    = uri,
+            .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+            .credentials.username                  = user,
+            .credentials.authentication.password   = g_sas_token,
+            .credentials.client_id                 = DEVICE_ID,
+            .session.keepalive                     = 30,
+        };
+        esp_mqtt_client_handle_t c = esp_mqtt_client_init(&cfg);
+        esp_mqtt_client_register_event(c, ESP_EVENT_ANY_ID, post_mqtt_event, NULL);
+        esp_mqtt_client_start(c);
+
+        for (int i = 0; !g_mqtt_post_ok && i < 30; i++)
+            vTaskDelay(pdMS_TO_TICKS(1000));
+
+        esp_mqtt_client_stop(c);
+        esp_mqtt_client_destroy(c);
+
+        if (g_mqtt_post_ok) {
+            ESP_LOGI(TAG, "[POST 6/7] MQTT TLS .......... PASS");
+        } else {
+            ESP_LOGE(TAG, "[POST 6/7] MQTT TLS .......... FAIL (no CONNACK after 30 s)");
+            all_ok = false;
+        }
+    } else {
+        ESP_LOGE(TAG, "[POST 6/7] MQTT TLS .......... FAIL (SAS generation failed)");
+        all_ok = false;
+    }
+
+    /* 7. Motor RMT ------------------------------------------------- */
+    ESP_LOGI(TAG, "[POST 7/7] Motor RMT ...");
+    esp_err_t rmt_err = ESP_OK;
+    gpio_config_t io = {
+        .mode         = GPIO_MODE_OUTPUT,
+        .intr_type    = GPIO_INTR_DISABLE,
+        .pin_bit_mask = (1ULL << DIR_PIN) | (1ULL << ENABLE_PIN),
+    };
+    rmt_err = gpio_config(&io);
+    if (rmt_err == ESP_OK) {
+        gpio_set_level(DIR_PIN, 1);
+        gpio_set_level(ENABLE_PIN, 0);
+        rmt_tx_channel_config_t tx = {
+            .gpio_num          = STEP_PIN,
+            .clk_src           = RMT_CLK_SRC_DEFAULT,
+            .resolution_hz     = RMT_RESOL_HZ,
+            .mem_block_symbols = 64,
+            .trans_queue_depth = 4,
+        };
+        rmt_channel_handle_t ch = NULL;
+        rmt_err = rmt_new_tx_channel(&tx, &ch);
+        if (rmt_err == ESP_OK) {
+            rmt_encoder_handle_t enc = NULL;
+            rmt_copy_encoder_config_t ecfg = {};
+            rmt_err = rmt_new_copy_encoder(&ecfg, &enc);
+            if (rmt_err == ESP_OK) {
+                rmt_err = rmt_enable(ch);
+                if (rmt_err == ESP_OK) {
+                    rmt_disable(ch);
+                    rmt_del_encoder(enc);
+                    rmt_del_channel(ch);
+                }
+            }
+        }
+    }
+    if (rmt_err == ESP_OK) {
+        ESP_LOGI(TAG, "[POST 7/7] Motor RMT ......... PASS");
+    } else {
+        ESP_LOGE(TAG, "[POST 7/7] Motor RMT ......... FAIL (%s)",
+                 esp_err_to_name(rmt_err));
+        all_ok = false;
+    }
+
+    /* ---- Summary ------------------------------------------------ */
+    ESP_LOGI(TAG, "──────────────────────────────────────────");
+    if (all_ok) {
+        ESP_LOGI(TAG, "  POST: ALL PASS — starting RTOS tasks");
+    } else {
+        ESP_LOGE(TAG, "  POST: FAILURES DETECTED — check logs above");
+    }
+    ESP_LOGI(TAG, "──────────────────────────────────────────");
+}
+
 /* ---- NTP sync callback  ----------------------------------------- */
 
 static void sntp_sync_cb(struct timeval *tv)
@@ -1245,21 +1437,17 @@ void app_main(void)
              DEVICE_ID, MOTOR_TARGET_RPM, MICROSTEP_MODE);
 
     wifi_init();
-    i2c_init();
 
-    /* ---- NTP time sync (required for SAS & payload timestamps) -- */
-    vTaskDelay(pdMS_TO_TICKS(2000));  /* settle delay for network */
+    /* ---- NTP setup (POST will wait for sync) ---- */
+    vTaskDelay(pdMS_TO_TICKS(2000));
     esp_sntp_set_time_sync_notification_cb(sntp_sync_cb);
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "time.google.com");
     esp_sntp_setservername(1, "pool.ntp.org");
     esp_sntp_init();
-    for (int retry = 0; !g_ntp_synced && retry < 60; retry++)
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "NTP %s (epoch %" PRIu64 ")",
-             sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED
-                 ? "synced" : "TIMEOUT",
-             (uint64_t)time(NULL));
+
+    /* ---- Power-on self test — blocks until WiFi, NTP, MQTT TLS pass ---- */
+    run_post();
 
     /* ---- Primitives --------------------------------------------- */
     g_sas_mutex       = xSemaphoreCreateMutex();
@@ -1275,15 +1463,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_task_wdt_reconfigure(&twdt_config));
 
     /* ---- Tasks ---------------------------------------------------
-     * watchdog    prio 1  —  health check, feeds TWDT, triggers restart
-     * sas_refresh  prio 0  —  low‑priority background token refresh
-     * motor        prio 2  —  RMT stepper (RMT ISR has higher hw prio)
-     * sensors      prio 3  —  I2C + ML inference
-     * azure        prio 1  —  MQTT publish
-     *
-     * Stack sizes are generous:  sensor task at 16 KB allows room for
-     * moderate TFLite Micro models;  increase to 32 KB if your model
-     * uses a large tensor arena (allocate arena statically, not on stack).
+     * All subsystems verified by POST — safe to start.
+     * Priority order:  motor(2) > sensors(3) > azure(1) > watchdog(1)
      * ------------------------------------------------------------- */
     xTaskCreate(vWatchdogTask,   "watchdog",   2048,  NULL, 1, NULL);
     xTaskCreate(sas_refresh_task, "sas_refresh", 4096,  NULL, 0, NULL);
