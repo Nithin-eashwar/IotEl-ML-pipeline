@@ -526,6 +526,8 @@ static ml_result_t ml_infer_window(sensor_features_t f, float ax, float ay,
 
 static void i2c_init(void)
 {
+    if (g_i2c_bus != NULL) return;     /* already initialised (e.g. by POST) */
+
     i2c_master_bus_config_t cfg = {
         .clk_source                     = I2C_CLK_SRC_DEFAULT,
         .i2c_port                       = I2C_MASTER_PORT,
@@ -581,6 +583,8 @@ static float tmp117_read(void)
 
 static void ntc_init(void)
 {
+    if (g_adc_handle != NULL) return;   /* already initialised (e.g. by POST) */
+
     adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = ADC_UNIT_1,
     };
@@ -1317,13 +1321,13 @@ static void run_post(void)
     /* 5. ML model -------------------------------------------------- */
     ESP_LOGI(TAG, "[POST 5/7] ML model ...");
 #if NILM_MODEL_AVAILABLE
-    ESP_LOGI(TAG, "[POST 5/7] ML model .......... PASS (%d features, %d trees)",
+    ESP_LOGI(TAG, "[POST 5/7] ML model .......... PASS (%d features, %d classes)",
              NILM_MODEL_FEATURE_COUNT, NILM_MODEL_CLASS_COUNT);
 #else
     ESP_LOGW(TAG, "[POST 5/7] ML model .......... SKIP (no model, using threshold)");
 #endif
 
-    /* 6. SAS + MQTT TLS -------------------------------------------- */
+    /* 6. SAS + MQTT TLS (up to 3 attempts — cert bundle can be slow) -- */
     ESP_LOGI(TAG, "[POST 6/7] MQTT TLS ...");
     if (generate_sas_token(g_sas_token, sizeof(g_sas_token))) {
         g_sas_valid = true;
@@ -1335,29 +1339,39 @@ static void run_post(void)
         snprintf(user, sizeof(user), "%s/%s/?api-version=2021-04-12",
                  IOT_HUB_HOST, DEVICE_ID);
 
-        g_mqtt_post_ok = false;
-        esp_mqtt_client_config_t cfg = {
-            .broker.address.uri                    = uri,
-            .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
-            .credentials.username                  = user,
-            .credentials.authentication.password   = g_sas_token,
-            .credentials.client_id                 = DEVICE_ID,
-            .session.keepalive                     = 30,
-        };
-        esp_mqtt_client_handle_t c = esp_mqtt_client_init(&cfg);
-        esp_mqtt_client_register_event(c, ESP_EVENT_ANY_ID, post_mqtt_event, NULL);
-        esp_mqtt_client_start(c);
+        bool tls_ok = false;
+        for (int attempt = 1; attempt <= 3 && !tls_ok; attempt++) {
+            if (attempt > 1) {
+                ESP_LOGW(TAG, "  TLS attempt %d/3 ...", attempt);
+                vTaskDelay(pdMS_TO_TICKS(5000));
+            }
 
-        for (int i = 0; !g_mqtt_post_ok && i < 30; i++)
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            g_mqtt_post_ok = false;
+            esp_mqtt_client_config_t cfg = {
+                .broker.address.uri                    = uri,
+                .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+                .credentials.username                  = user,
+                .credentials.authentication.password   = g_sas_token,
+                .credentials.client_id                 = DEVICE_ID,
+                .session.keepalive                     = 30,
+            };
+            esp_mqtt_client_handle_t c = esp_mqtt_client_init(&cfg);
+            esp_mqtt_client_register_event(c, ESP_EVENT_ANY_ID,
+                                           post_mqtt_event, NULL);
+            esp_mqtt_client_start(c);
 
-        esp_mqtt_client_stop(c);
-        esp_mqtt_client_destroy(c);
+            for (int i = 0; !g_mqtt_post_ok && i < 30; i++)
+                vTaskDelay(pdMS_TO_TICKS(1000));
 
-        if (g_mqtt_post_ok) {
+            esp_mqtt_client_stop(c);
+            esp_mqtt_client_destroy(c);
+            tls_ok = g_mqtt_post_ok;
+        }
+
+        if (tls_ok) {
             ESP_LOGI(TAG, "[POST 6/7] MQTT TLS .......... PASS");
         } else {
-            ESP_LOGE(TAG, "[POST 6/7] MQTT TLS .......... FAIL (no CONNACK after 30 s)");
+            ESP_LOGE(TAG, "[POST 6/7] MQTT TLS .......... FAIL (3 attempts)");
             all_ok = false;
         }
     } else {
